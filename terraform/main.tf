@@ -1,7 +1,7 @@
 locals {
   aks_cluster_name = "${var.resource_prefix}-aks"
 }
-
+#1
 module "resourcegroups" {
   source                  = "./modules/resourcegroups"
   resource_group_name     = var.resource_group_name
