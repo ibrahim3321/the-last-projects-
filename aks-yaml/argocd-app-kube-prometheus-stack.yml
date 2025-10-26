@@ -1,0 +1,168 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 65.0.0     
+    helm:
+      values: |-
+        global:
+          scrape_interval: 15s
+          evaluation_interval: 15s
+
+        prometheusOperator:
+          enabled: true
+          createCustomResource: true
+          tls:
+            enabled: false
+
+        # Alertmanager: public LB + Slack (file) + CallMeBot (webhook)
+        alertmanager:
+          enabled: true
+          service:
+            type: ClusterIP
+          alertmanagerSpec:
+            replicas: 1
+            resources:
+              requests: { cpu: 100m, memory: 128Mi }
+            secrets:
+              - slack-webhook-url   # secret must exist in monitoring ns
+          config:
+            global:
+              resolve_timeout: 5m
+            route:
+              group_by: ['alertname','namespace']
+              group_wait: 30s
+              group_interval: 5m
+              repeat_interval: 2h
+              receiver: slack-default
+              routes:
+                - matchers:
+                    - severity =~ "critical|page"
+                    - team = "web"
+                  receiver: callmebot
+                  continue: false
+                - matchers:
+                    - source = "github-actions"
+                  receiver: slack-default
+                  continue: false
+            receivers:
+              - name: slack-default
+                slack_configs:
+                  - send_resolved: true
+                    api_url_file: /etc/alertmanager/secrets/slack-webhook-url/url
+                    title: '[[{{ .CommonLabels.severity | default "info" | toUpper }}]] {{ .CommonLabels.alertname }} ({{ .Status }})'
+                    text: >-
+                      {{- range .Alerts -}}
+                      *{{ .Annotations.summary | default .Annotations.description | default .Labels.alertname }}*
+                      ns={{ .Labels.namespace | default "n/a" }} pod={{ .Labels.pod | default "n/a" }}
+                      {{- end }}
+              - name: callmebot
+                webhook_configs:
+                  - url: "http://callmebot-adapter.monitoring.svc.cluster.local:8080/webhook"
+                    send_resolved: true
+
+        prometheus:
+          prometheusSpec:
+            retention: 15d
+            replicas: 1
+            serviceMonitorSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  accessModes: ["ReadWriteOnce"]
+                  storageClassName: default
+                  resources:
+                    requests:
+                      storage: 50Gi
+            resources:
+              requests: { cpu: 200m, memory: 512Mi }
+              limits:   { cpu: 500m, memory: 1Gi }
+          service:
+            type: LoadBalancer
+            port: 80
+            targetPort: 9090
+            annotations:
+              service.beta.kubernetes.io/azure-load-balancer-internal: "false"
+
+        nodeExporter:
+          enabled: true
+          tolerations:
+            - key: "node-role.kubernetes.io/master"
+              operator: "Exists"
+              effect: "NoSchedule"
+
+        kubeStateMetrics:
+          enabled: true
+
+        grafana:
+          enabled: false
+
+        kubeControllerManager: { enabled: true }
+        kubeScheduler:        { enabled: true }
+        kubeProxy:            { enabled: true }
+
+        additionalPrometheusRulesMap:
+          web-and-pipeline:
+            groups:
+              - name: ingress-web-health
+                rules:
+                  - alert: IngressHigh5xxRate
+                    expr: |
+                      sum(rate(nginx_ingress_controller_requests{status=~"5.."}[5m]))
+                      /
+                      sum(rate(nginx_ingress_controller_requests[5m])) > 0.01
+                    for: 5m
+                    labels: { severity: critical, team: web }
+                    annotations:
+                      summary: "High 5xx error rate on ingress"
+                      description: "5xx > 1% (5m window)."
+                  - alert: IngressHighLatencyP95
+                    expr: |
+                      histogram_quantile(0.95,
+                        sum(rate(nginx_ingress_controller_response_duration_seconds_bucket[5m]))
+                        by (le)
+                      ) > 1
+                    for: 5m
+                    labels: { severity: critical, team: web }
+                    annotations:
+                      summary: "High p95 latency at ingress"
+                      description: "p95 response time > 1s (5m)."
+              - name: k8s-web-health
+                rules:
+                  - alert: WebDeploymentUnavailable
+                    expr: |
+                      kube_deployment_status_replicas_unavailable{deployment=~"frontend-deployment|backend-deployment"} > 0
+                    for: 3m
+                    labels: { severity: critical, team: web }
+                    annotations:
+                      summary: "Web deployment unavailable"
+                      description: "One or more web deployments have unavailable replicas."
+                  - alert: PodCrashLooping
+                    expr: increase(kube_pod_container_status_restarts_total[5m]) > 5
+                    for: 5m
+                    labels: { severity: warning, team: web }
+                    annotations:
+                      summary: "Pod restarting frequently"
+                      description: "Container restarts > 5 in the last 5 minutes."
+              - name: pipeline-external
+                rules:
+                  - alert: PipelineFailed
+                    expr: vector(1) == 0
+                    labels: { severity: warning, source: github-actions }
+                    annotations:
+                      summary: "Pipeline failure (external)"
+                      description: "Triggered by GitHub Actions posting to Alertmanager v2."

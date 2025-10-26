@@ -1,0 +1,59 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: grafana
+  namespace: argocd
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: grafana
+    targetRevision: 8.6.0         
+    helm:
+      values: |-
+        admin:
+          existingSecret: grafana-admin-credentials
+          userKey: admin-user
+          passwordKey: admin-password
+
+        service:
+          type: LoadBalancer
+          port: 80
+          annotations:
+            service.beta.kubernetes.io/azure-load-balancer-internal: "false"
+
+        persistence:
+          enabled: true
+          size: 10Gi
+          storageClassName: managed-csi
+
+        deploymentStrategy:
+          type: Recreate
+
+        ingress:
+          enabled: false
+
+        # Datasource points to the in-cluster Prometheus service (no IP needed)
+        datasources:
+          datasources.yaml:
+            apiVersion: 1
+            datasources:
+              - name: Prometheus
+                type: prometheus
+                access: proxy
+                url: http://prometheus-kube-prometheus-prometheus.monitoring:9090
+                isDefault: true
+                editable: false
+                jsonData:
+                  timeInterval: 15s
+
+        resources:
+          requests: { cpu: 100m, memory: 256Mi }
+          limits:   { cpu: 500m, memory: 512Mi }
