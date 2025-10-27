@@ -1,7 +1,7 @@
 name: Build Images
 
 on:
-
+ 
   workflow_dispatch:
     inputs:
       branch:
@@ -16,7 +16,6 @@ on:
           - dev
           - prod
 
-  
   push:
     branches:
       - feature/ci-cd
@@ -31,10 +30,14 @@ concurrency:
 
 jobs:
   build:
+   
+    if: github.event_name == 'workflow_dispatch'
+
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
+
     outputs:
       ENV: ${{ github.event.inputs.environment }}
 
@@ -46,8 +49,7 @@ jobs:
 
       - name: Set ENV manually from input
         id: envsel
-        run: |
-          echo "ENV=${{ github.event.inputs.environment }}" >> "$GITHUB_OUTPUT"
+        run: echo "ENV=${{ github.event.inputs.environment }}" >> "$GITHUB_OUTPUT"
 
       - name: 🔐 Azure Login (SPN JSON)
         uses: azure/login@v1
