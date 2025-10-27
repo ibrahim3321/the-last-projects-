@@ -1,106 +1,93 @@
 name: Build Images
 
 on:
-  push:
-    branches: [ main, feature/ci-cd ]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Select the branch to build (feature/ci-cd or main)"
+        required: true
+        default: "feature/ci-cd"
+      environment:
+        description: "Select environment (dev or prod)"
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
 
 env:
   REGISTRY_FQDN_SUFFIX: azurecr.io
+
+concurrency:
+  group: build-${{ github.event.inputs.environment }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
+      id-token: write
       contents: read
     outputs:
-      ENV: ${{ steps.envsel.outputs.ENV }}
+      ENV: ${{ github.event.inputs.environment }}
 
     steps:
-      - name: Checkout
+      - name: Checkout selected branch
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
 
-      - name: Choose environment from branch
+      - name: Set ENV manually from input
         id: envsel
-        shell: bash
         run: |
-          if [ "${GITHUB_REF##*/}" = "main" ]; then
-            echo "ENV=prod" >> "$GITHUB_OUTPUT"
-          else
-            echo "ENV=dev" >> "$GITHUB_OUTPUT"
-          fi
+          echo "ENV=${{ github.event.inputs.environment }}" >> "$GITHUB_OUTPUT"
 
-      # Azure login using client-secret JSON stored in AZURE_CREDENTIALS
-      - name: 🔐 Azure Login (client secret JSON)
-        uses: azure/login@v2
+      - name: 🔐 Azure Login (SPN JSON)
+        uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Derive ACR FQDN and login
+      - name: Resolve ACR FQDN and login
         id: acr
         shell: bash
         run: |
           ACR_NAME="${{ secrets.ACR_NAME }}"
-          if [ -z "$ACR_NAME" ]; then
-            echo "ACR_NAME secret is required"; exit 1
-          fi
+          test -n "$ACR_NAME" || { echo "Missing secret ACR_NAME"; exit 1; }
           echo "ACR=${ACR_NAME}.${REGISTRY_FQDN_SUFFIX}" >> "$GITHUB_OUTPUT"
           az acr login --name "$ACR_NAME"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Prepare build metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ${{ steps.acr.outputs.ACR }}/backend
-            ${{ steps.acr.outputs.ACR }}/frontend
-            ${{ steps.acr.outputs.ACR }}/callmebot-adapter
-          tags: |
-            type=raw,value=latest-${{ steps.envsel.outputs.ENV }}
-            type=raw,value=${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
-          labels: |
-            org.opencontainers.image.source=${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
-
-      # Backend
       - name: Build & push backend
         uses: docker/build-push-action@v5
         with:
           context: ./backend
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR }}/backend:latest-${{ steps.envsel.outputs.ENV }}
-            ${{ steps.acr.outputs.ACR }}/backend:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
-          labels: ${{ steps.meta.outputs.labels }}
+            ${{ steps.acr.outputs.ACR }}/backend:latest-${{ github.event.inputs.environment }}
+            ${{ steps.acr.outputs.ACR }}/backend:${{ github.sha }}-${{ github.event.inputs.environment }}
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/backend:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/backend:buildcache,mode=max
 
-      # Frontend
       - name: Build & push frontend
         uses: docker/build-push-action@v5
         with:
           context: ./frontend
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR }}/frontend:latest-${{ steps.envsel.outputs.ENV }}
-            ${{ steps.acr.outputs.ACR }}/frontend:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
-          labels: ${{ steps.meta.outputs.labels }}
+            ${{ steps.acr.outputs.ACR }}/frontend:latest-${{ github.event.inputs.environment }}
+            ${{ steps.acr.outputs.ACR }}/frontend:${{ github.sha }}-${{ github.event.inputs.environment }}
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/frontend:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/frontend:buildcache,mode=max
 
-      # Callmebot adapter
       - name: Build & push callmebot-adapter
         uses: docker/build-push-action@v5
         with:
           context: ./aks-yaml/callmebot
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR }}/callmebot-adapter:latest-${{ steps.envsel.outputs.ENV }}
-            ${{ steps.acr.outputs.ACR }}/callmebot-adapter:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
-          labels: ${{ steps.meta.outputs.labels }}
+            ${{ steps.acr.outputs.ACR }}/callmebot-adapter:latest-${{ github.event.inputs.environment }}
+            ${{ steps.acr.outputs.ACR }}/callmebot-adapter:${{ github.sha }}-${{ github.event.inputs.environment }}
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/callmebot-adapter:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/callmebot-adapter:buildcache,mode=max
