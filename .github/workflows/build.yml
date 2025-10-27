@@ -1,6 +1,7 @@
 name: Build Images
 
 on:
+
   workflow_dispatch:
     inputs:
       branch:
@@ -15,11 +16,17 @@ on:
           - dev
           - prod
 
+  
+  push:
+    branches:
+      - feature/ci-cd
+      - main
+
 env:
   REGISTRY_FQDN_SUFFIX: azurecr.io
 
 concurrency:
-  group: build-${{ github.event.inputs.environment }}
+  group: build-${{ github.event.inputs.environment || 'auto' }}
   cancel-in-progress: true
 
 jobs:
