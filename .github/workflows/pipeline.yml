@@ -136,6 +136,23 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # 👇 NEW: Export ARM_* so AzureRM uses SP + client secret (not Azure CLI)
+      - name: Export ARM env for Service Principal (from AZURE_CREDENTIALS)
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y jq
+          CREDS='${{ secrets.AZURE_CREDENTIALS }}'
+          echo "$CREDS" | jq .
+          ARM_CLIENT_ID=$(echo "$CREDS" | jq -r '.clientId // .appId')
+          ARM_CLIENT_SECRET=$(echo "$CREDS" | jq -r '.clientSecret // .password')
+          ARM_TENANT_ID=$(echo "$CREDS" | jq -r '.tenantId // .tenant')
+          ARM_SUBSCRIPTION_ID=$(echo "$CREDS" | jq -r '.subscriptionId // .subscription')
+          echo "ARM_CLIENT_ID=$ARM_CLIENT_ID" >> $GITHUB_ENV
+          echo "ARM_CLIENT_SECRET=$ARM_CLIENT_SECRET" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=$ARM_TENANT_ID" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=$ARM_SUBSCRIPTION_ID" >> $GITHUB_ENV
+          echo "ARM_ENVIRONMENT=public" >> $GITHUB_ENV
+        shell: bash
+
       - name: Pull external ACR id
         id: acr
         run: |
@@ -157,6 +174,11 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.5
+
+      # If your Terraform backend is azurerm and account keys are disabled,
+      # ensure your backend block includes: use_azuread_auth = true
+      # (and grant Storage Blob Data Owner on the state storage)
+      # https://developer.hashicorp.com/terraform/language/backend/azurerm
 
       - name: Terraform Init/Plan/Apply
         working-directory: ./terraform
@@ -289,8 +311,6 @@ jobs:
             kubectl apply -f aks-yaml/argocd/app-secrets-dev.yaml
             kubectl apply -f aks-yaml/argocd/app-dev.yaml
           fi
-          # Optional: also apply root app if you use it
-          # kubectl apply -f aks-yaml/argocd/root-app.yaml
 
       - name: Show ArgoCD Applications
         run: kubectl get applications.argoproj.io -A
