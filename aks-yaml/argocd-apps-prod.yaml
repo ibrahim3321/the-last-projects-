@@ -6,7 +6,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/<YOUR_GITHUB>/<YOUR_REPO>
+    repoURL: https://github.com/ibrahim3321/the-last-projects-
     targetRevision: main
     path: aks-yaml/prod
   destination:
