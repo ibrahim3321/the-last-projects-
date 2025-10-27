@@ -30,7 +30,7 @@ jobs:
             echo "ENV=dev" >> "$GITHUB_OUTPUT"
           fi
 
-      # ---- Azure login via client-secret JSON (no OIDC) ----
+      # Azure login using client-secret JSON stored in AZURE_CREDENTIALS
       - name: 🔐 Azure Login (client secret JSON)
         uses: azure/login@v2
         with:
@@ -40,10 +40,12 @@ jobs:
         id: acr
         shell: bash
         run: |
-          : "${{ secrets.ACR_NAME?ACR_NAME secret is required}}"
           ACR_NAME="${{ secrets.ACR_NAME }}"
+          if [ -z "$ACR_NAME" ]; then
+            echo "ACR_NAME secret is required"; exit 1
+          fi
           echo "ACR=${ACR_NAME}.${REGISTRY_FQDN_SUFFIX}" >> "$GITHUB_OUTPUT"
-          az acr login --name "${ACR_NAME}"
+          az acr login --name "$ACR_NAME"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -64,7 +66,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
 
-      # -------- Backend --------
+      # Backend
       - name: Build & push backend
         uses: docker/build-push-action@v5
         with:
@@ -77,7 +79,7 @@ jobs:
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/backend:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/backend:buildcache,mode=max
 
-      # -------- Frontend --------
+      # Frontend
       - name: Build & push frontend
         uses: docker/build-push-action@v5
         with:
@@ -90,7 +92,7 @@ jobs:
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/frontend:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/frontend:buildcache,mode=max
 
-      # -------- Callmebot adapter --------
+      # Callmebot adapter
       - name: Build & push callmebot-adapter
         uses: docker/build-push-action@v5
         with:
