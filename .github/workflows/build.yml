@@ -1,90 +1,78 @@
-name: Build Images & Bump Overlays
+name: Build Images
 
 on:
   push:
     branches: [ main, feature/ci-cd ]
-    paths:
-      - 'backend/**'
-      - 'frontend/**'
-      - 'aks-yaml/callmebot/**'
-      - '.github/workflows/build.yml'
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 env:
-  REGISTRY: ${{ secrets.ACR_NAME }}         # e.g., group6kubacr.azurecr.io
-  BACKEND_IMG: backend
-  FRONTEND_IMG: frontend
-  CALLMEBOT_IMG: callmebot-adapter
+  REGISTRY_FQDN_SUFFIX: azurecr.io
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      ENV: ${{ steps.envsel.outputs.ENV }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Azure Login
+      - name: Choose environment from branch
+        id: envsel
+        run: |
+          if [ "${GITHUB_REF##*/}" = "main" ]; then
+            echo "ENV=prod" >> $GITHUB_OUTPUT
+          else
+            echo "ENV=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
+          tenant-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).tenantId }}
+          subscription-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).subscriptionId }}
 
-      - name: Azure Container Registry Login
-        uses: azure/docker-login@v2
+      - name: Derive ACR FQDN and login
+        id: acr
+        shell: bash
+        run: |
+          ACR_NAME="${{ secrets.ACR_NAME }}"
+          echo "ACR=${ACR_NAME}.${REGISTRY_FQDN_SUFFIX}" >> $GITHUB_OUTPUT
+          az acr login --name "${ACR_NAME}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Backend
+      - name: Build & push backend
+        uses: docker/build-push-action@v5
         with:
-          login-server: ${{ env.REGISTRY }}
+          context: ./backend
+          push: true
+          tags: |
+            ${{ steps.acr.outputs.ACR }}/backend:latest-${{ steps.envsel.outputs.ENV }}
+            ${{ steps.acr.outputs.ACR }}/backend:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
 
-      # --------- Build Backend ----------
-      - name: Build backend
-        working-directory: backend
-        run: |
-          TAG=${GITHUB_SHA::7}
-          docker build -t $REGISTRY/$BACKEND_IMG:$TAG -t $REGISTRY/$BACKEND_IMG:latest .
-          docker push $REGISTRY/$BACKEND_IMG:$TAG
-          docker push $REGISTRY/$BACKEND_IMG:latest
-          echo "BACKEND_TAG=$TAG" >> $GITHUB_ENV
+      # Frontend
+      - name: Build & push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ steps.acr.outputs.ACR }}/frontend:latest-${{ steps.envsel.outputs.ENV }}
+            ${{ steps.acr.outputs.ACR }}/frontend:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
 
-      # --------- Build Frontend ----------
-      - name: Build frontend
-        working-directory: frontend
-        run: |
-          TAG=${GITHUB_SHA::7}
-          docker build -t $REGISTRY/$FRONTEND_IMG:$TAG -t $REGISTRY/$FRONTEND_IMG:latest .
-          docker push $REGISTRY/$FRONTEND_IMG:$TAG
-          docker push $REGISTRY/$FRONTEND_IMG:latest
-          echo "FRONTEND_TAG=$TAG" >> $GITHUB_ENV
-
-      # --------- Build Callmebot ----------
-      - name: Build callmebot-adapter
-        working-directory: aks-yaml/callmebot
-        run: |
-          TAG=${GITHUB_SHA::7}
-          docker build -t $REGISTRY/$CALLMEBOT_IMG:$TAG -t $REGISTRY/$CALLMEBOT_IMG:latest .
-          docker push $REGISTRY/$CALLMEBOT_IMG:$TAG
-          docker push $REGISTRY/$CALLMEBOT_IMG:latest
-          echo "CALLMEBOT_TAG=$TAG" >> $GITHUB_ENV
-
-      # --------- Update Overlays (dev/prod) ----------
-      - name: Update kustomize image tags (dev/prod)
-        run: |
-          update_patch () {
-            ENV_DIR=$1
-            FILE="aks-yaml/overlays/$ENV_DIR/patch-images.yaml"
-            [ -f "$FILE" ] || { echo "Missing $FILE"; exit 1; }
-            # Replace image tags for backend, frontend, callmebot
-            sed -i -E "s|($REGISTRY/$BACKEND_IMG):[a-z0-9]+|\\1:${BACKEND_TAG}|g" "$FILE"
-            sed -i -E "s|($REGISTRY/$FRONTEND_IMG):[a-z0-9]+|\\1:${FRONTEND_TAG}|g" "$FILE"
-            sed -i -E "s|($REGISTRY/$CALLMEBOT_IMG):[a-z0-9]+|\\1:${CALLMEBOT_TAG}|g" "$FILE"
-          }
-          update_patch dev || true
-          update_patch prod || true
-
-      - name: Commit & push overlay changes
-        if: ${{ github.ref != 'refs/heads/main' || github.ref == 'refs/heads/main' }}
-        run: |
-          git config user.name "ci-bot"
-          git config user.email "ci-bot@users.noreply.github.com"
-          git add aks-yaml/overlays/dev/patch-images.yaml || true
-          git add aks-yaml/overlays/prod/patch-images.yaml || true
-          git commit -m "chore: bump images to $GITHUB_SHA" || echo "No changes to commit"
-          git push
+      # Callmebot adapter
+      - name: Build & push callmebot-adapter
+        uses: docker/build-push-action@v5
+        with:
+          context: ./aks-yaml/callmebot
+          push: true
+          tags: |
+            ${{ steps.acr.outputs.ACR }}/callmebot-adapter:latest-${{ steps.envsel.outputs.ENV }}
+            ${{ steps.acr.outputs.ACR }}/callmebot-adapter:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
