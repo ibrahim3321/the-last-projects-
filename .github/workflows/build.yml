@@ -82,3 +82,12 @@ jobs:
             ${{ steps.acr.outputs.ACR }}/callmebot-adapter:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/callmebot-adapter:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/callmebot-adapter:buildcache,mode=max
+
+      - name: 🚀 Trigger Infra (Terraform)
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: "Infra (Terraform)"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.ref }}
+          inputs: |
+            environment=${{ steps.envsel.outputs.ENV }}
