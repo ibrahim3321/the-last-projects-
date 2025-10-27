@@ -1,19 +1,24 @@
 name: Infra (Terraform)
 
 on:
-  workflow_run:
-    workflows: [ Build Images ]
-    types: [ completed ]
-    branches: [ main, feature/ci-cd ]
-  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      environment:
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select environment (dev or prod)"
+        required: false
+        default: "dev"
 
 concurrency:
-  group: infra-${{ github.event.workflow_run.head_branch || github.ref_name }}
+  group: infra-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
   terraform:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -25,12 +30,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Decide ENV from branch
+      - name: Decide ENV from input or branch
         id: envsel
         shell: bash
         run: |
-          BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
-          if [ "$BRANCH" = "main" ]; then ENV=prod; else ENV=dev; fi
+          if [ -n "${{ inputs.environment }}" ]; then
+            ENV=${{ inputs.environment }}
+          else
+            BRANCH="${GITHUB_REF_NAME:-${GITHUB_REF##*/}}"
+            if [ "$BRANCH" = "main" ]; then ENV=prod; else ENV=dev; fi
+          fi
           echo "ENV=$ENV" >> "$GITHUB_OUTPUT"
 
       - name: 🔐 Azure Login (SPN JSON)
