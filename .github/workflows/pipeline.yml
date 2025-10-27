@@ -59,7 +59,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: " Azure Login"
+      - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
@@ -124,7 +124,6 @@ jobs:
       contents: read
     env:
       TF_IN_AUTOMATION: "true"
-      ARM_USE_OIDC: "true"
     outputs:
       AKS_NAME: ${{ steps.aksnames.outputs.AKS }}
       RG_NAME:  ${{ steps.aksnames.outputs.RG }}
@@ -132,7 +131,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: " Azure Login"
+      - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
@@ -203,7 +202,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: " Azure Login"
+      - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
