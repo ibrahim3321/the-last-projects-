@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: frontend
+          image: REPLACED_BY_KUSTOMIZE_FRONTEND
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: backend
+          image: REPLACED_BY_KUSTOMIZE_BACKEND
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: callmebot-adapter
+spec:
+  template:
+    spec:
+      containers:
+        - name: adapter
+          image: REPLACED_BY_KUSTOMIZE_CALLMEBOT
