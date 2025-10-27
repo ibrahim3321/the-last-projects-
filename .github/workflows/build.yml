@@ -1,55 +1,37 @@
 name: Build Images
 
 on:
- 
-  workflow_dispatch:
-    inputs:
-      branch:
-        description: "Select the branch to build (feature/ci-cd or main)"
-        required: true
-        default: "feature/ci-cd"
-      environment:
-        description: "Select environment (dev or prod)"
-        required: true
-        type: choice
-        options:
-          - dev
-          - prod
-
   push:
-    branches:
-      - feature/ci-cd
-      - main
+    branches: [ main, feature/ci-cd ]
+  workflow_dispatch: {}
 
 env:
   REGISTRY_FQDN_SUFFIX: azurecr.io
 
 concurrency:
-  group: build-${{ github.event.inputs.environment || 'auto' }}
+  group: build-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
   build:
-   
-    if: github.event_name == 'workflow_dispatch'
-
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
-
     outputs:
-      ENV: ${{ github.event.inputs.environment }}
+      ENV: ${{ steps.envsel.outputs.ENV }}
 
     steps:
-      - name: Checkout selected branch
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.branch }}
 
-      - name: Set ENV manually from input
+      - name: Decide ENV from branch
         id: envsel
-        run: echo "ENV=${{ github.event.inputs.environment }}" >> "$GITHUB_OUTPUT"
+        shell: bash
+        run: |
+          BR="${GITHUB_REF_NAME:-${GITHUB_REF##*/}}"
+          if [ "$BR" = "main" ]; then ENV=prod; else ENV=dev; fi
+          echo "ENV=$ENV" >> "$GITHUB_OUTPUT"
 
       - name: 🔐 Azure Login (SPN JSON)
         uses: azure/login@v1
@@ -74,8 +56,8 @@ jobs:
           context: ./backend
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR }}/backend:latest-${{ github.event.inputs.environment }}
-            ${{ steps.acr.outputs.ACR }}/backend:${{ github.sha }}-${{ github.event.inputs.environment }}
+            ${{ steps.acr.outputs.ACR }}/backend:latest-${{ steps.envsel.outputs.ENV }}
+            ${{ steps.acr.outputs.ACR }}/backend:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/backend:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/backend:buildcache,mode=max
 
@@ -85,8 +67,8 @@ jobs:
           context: ./frontend
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR }}/frontend:latest-${{ github.event.inputs.environment }}
-            ${{ steps.acr.outputs.ACR }}/frontend:${{ github.sha }}-${{ github.event.inputs.environment }}
+            ${{ steps.acr.outputs.ACR }}/frontend:latest-${{ steps.envsel.outputs.ENV }}
+            ${{ steps.acr.outputs.ACR }}/frontend:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/frontend:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/frontend:buildcache,mode=max
 
@@ -96,7 +78,7 @@ jobs:
           context: ./aks-yaml/callmebot
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR }}/callmebot-adapter:latest-${{ github.event.inputs.environment }}
-            ${{ steps.acr.outputs.ACR }}/callmebot-adapter:${{ github.sha }}-${{ github.event.inputs.environment }}
+            ${{ steps.acr.outputs.ACR }}/callmebot-adapter:latest-${{ steps.envsel.outputs.ENV }}
+            ${{ steps.acr.outputs.ACR }}/callmebot-adapter:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/callmebot-adapter:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/callmebot-adapter:buildcache,mode=max
