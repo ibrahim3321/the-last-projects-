@@ -1,0 +1,124 @@
+name: Infra (Terraform + Enable AGIC)
+
+on:
+  workflow_run:
+    workflows: [ Build Images ]
+    types: [ completed ]
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Target environment (dev|prod). Default by branch."
+        type: choice
+        required: false
+        options: [dev, prod]
+
+jobs:
+  terraform:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TF_IN_AUTOMATION: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select environment
+        id: envsel
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.env }}" ]; then
+            ENV="${{ github.event.inputs.env }}"
+          else
+            BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
+            case "$BRANCH" in
+              main) ENV=prod ;;
+              feature/ci-cd) ENV=dev ;;
+              *) ENV=dev ;;
+            esac
+          fi
+          echo "ENV=$ENV" >> "$GITHUB_OUTPUT"
+          echo "Selected ENV=$ENV"
+
+      - name: "Azure Login"
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Resolve external ACR id
+        id: acr
+        shell: bash
+        run: |
+          ACR_NAME="${{ secrets.ACR_NAME }}"
+          ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
+          if [ -z "$ACR_ID" ]; then echo "Failed to resolve ACR id"; exit 1; fi
+          echo "ACR_ID=$ACR_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Write env.auto.tfvars & inject ACR id
+        working-directory: ./terraform
+        shell: bash
+        run: |
+          ENV="${{ steps.envsel.outputs.ENV }}"
+          if [ "$ENV" = "prod" ]; then
+            printf "%s\n" '${{ secrets.PROD }}' > env.auto.tfvars
+          else
+            printf "%s\n" '${{ secrets.DEV }}' > env.auto.tfvars
+          fi
+          echo "acr_id = \"${{ steps.acr.outputs.ACR_ID }}\"" >> env.auto.tfvars
+          echo "env.auto.tfvars ----"
+          cat env.auto.tfvars
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init -upgrade
+
+      - name: Terraform Plan
+        working-directory: ./terraform
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ./terraform
+        run: terraform apply -auto-approve tfplan
+
+      # ─────────────────────────────────────────────────────────────
+      # NEW: Manually enable AGIC (Application Gateway Ingress Controller)
+      # ─────────────────────────────────────────────────────────────
+      - name: Resolve AKS RG/name from tfvars
+        id: aksnames
+        shell: bash
+        run: |
+          ENV="${{ steps.envsel.outputs.ENV }}"
+          TFVARS_CONTENT="${{ steps.envsel.outputs.ENV == 'prod' && secrets.PROD || secrets.DEV }}"
+          printf "%s\n" "${TFVARS_CONTENT}" > .tfvars.tmp
+          RG=$(grep -E '^\s*resource_group_name' .tfvars.tmp | sed -E 's/.*=\s*"([^"]+)".*/\1/')
+          PREFIX=$(grep -E '^\s*resource_prefix' .tfvars.tmp | sed -E 's/.*=\s*"([^"]+)".*/\1/')
+          if [ -z "$RG" ] || [ -z "$PREFIX" ]; then echo "parse tfvars failed"; exit 1; fi
+          echo "RG=$RG"   >> "$GITHUB_OUTPUT"
+          echo "AKS=${PREFIX}-aks" >> "$GITHUB_OUTPUT"
+
+      - name: Enable AGIC (Application Gateway Ingress Controller)
+        env:
+          RESOURCE_GROUP: ${{ steps.aksnames.outputs.RG }}
+          AKS_NAME: ${{ steps.aksnames.outputs.AKS }}
+        run: |
+          # Create a simple App Gateway addon (AKS will create the managed resources if needed)
+          # Adjust names/cidr as you prefer or later move fully into Terraform.
+          set -e
+          echo "Enabling AGIC on AKS $AKS_NAME in RG $RESOURCE_GROUP ..."
+          az aks enable-addons \
+            -a ingress-appgw \
+            -n "$AKS_NAME" \
+            -g "$RESOURCE_GROUP" \
+            --appgw-name "${AKS_NAME}-appgw" \
+            --appgw-subnet-cidr "10.225.0.0/16" || {
+              echo "enable-addons failed (possibly already enabled). Showing current addon profile:"
+              az aks show -g "$RESOURCE_GROUP" -n "$AKS_NAME" --query addonProfiles.ingressApplicationGateway -o yaml || true
+            }
+          echo "AGIC ensure step completed."
