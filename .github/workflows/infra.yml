@@ -1,107 +1,123 @@
-name: Provision Infra (AKS/AGIC/ArgoCD)
+name: Infra (Terraform)
 
 on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: "Environment (dev or prod)"
-        required: true
-        default: "dev"
-        type: choice
-        options: [dev, prod]
+  workflow_run:
+    workflows: [ Build Images ]
+    types: [ completed ]
+  workflow_dispatch: {}
 
 jobs:
-  infra:
+  terraform:
+    # run if Build Images finished successfully OR this was manual
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write    # harmless here; kept for parity across workflows
+      contents: read
     env:
-      ENV: ${{ inputs.environment }}
+      TF_IN_AUTOMATION: "true"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Azure Login
-        uses: azure/login@v2
+      - name: Choose environment from branch
+        id: envsel
+        shell: bash
+        run: |
+          # If triggered by workflow_run, use its head_branch. Otherwise use ref_name.
+          BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
+          if [ "$BRANCH" = "main" ]; then
+            echo "ENV=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "ENV=dev" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Selected ENV=$(cat $GITHUB_OUTPUT | cut -d= -f2)"
+
+      # --- Azure login using SPN JSON (requested) ---
+      - name: 🔐 Azure Login (OIDC/SPN JSON)
+        uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # Export ARM_* for Terraform AzureRM provider (works with SPN JSON)
+      - name: Export ARM_* env for Terraform
+        id: arm
+        shell: bash
+        run: |
+          CREDS='${{ secrets.AZURE_CREDENTIALS }}'
+          clientId=$(echo "$CREDS" | jq -r '.clientId')
+          clientSecret=$(echo "$CREDS" | jq -r '.clientSecret')
+          tenantId=$(echo "$CREDS" | jq -r '.tenantId')
+          subscriptionId=$(echo "$CREDS" | jq -r '.subscriptionId')
+
+          {
+            echo "ARM_CLIENT_ID=$clientId"
+            echo "ARM_CLIENT_SECRET=$clientSecret"
+            echo "ARM_TENANT_ID=$tenantId"
+            echo "ARM_SUBSCRIPTION_ID=$subscriptionId"
+            echo "ARM_USE_MSI=false"
+            echo "ARM_USE_OIDC=false"
+          } >> "$GITHUB_ENV"
+
+      - name: Pull external ACR id
+        id: acr
+        shell: bash
+        run: |
+          ACR_NAME="${{ secrets.ACR_NAME }}"
+          if [ -z "$ACR_NAME" ]; then
+            echo "ACR_NAME secret is missing"; exit 1
+          fi
+          ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
+          if [ -z "$ACR_ID" ]; then
+            echo "Failed to resolve ACR id for $ACR_NAME"; exit 1
+          fi
+          echo "ACR_ID=$ACR_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Write env.auto.tfvars
+        working-directory: ./terraform
+        shell: bash
+        run: |
+          ENV="${{ steps.envsel.outputs.ENV }}"
+          tfvars_file="env.auto.tfvars"
+
+          # Write the environment-specific tfvars body from repo secrets
+          if [ "$ENV" = "prod" ]; then
+            printf "%s\n" '${{ secrets.PROD }}' > "$tfvars_file"
+          else
+            printf "%s\n" '${{ secrets.DEV }}' > "$tfvars_file"
+          fi
+
+          # Append computed/external values
+          {
+            echo ""
+            echo "# Injected by CI"
+            echo "acr_id = \"${{ steps.acr.outputs.ACR_ID }}\""
+          } >> "$tfvars_file"
+
+          echo "----- $tfvars_file -----"
+          cat "$tfvars_file" | sed 's/=.*/= ***redacted*** /' || true
+          echo "------------------------"
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
 
-      - name: Write tfvars from secret
-        run: |
-          if [ "$ENV" = "dev" ]; then
-            echo "${{ secrets.DEV }}" > terraform/env.tfvars
-          else
-            echo "${{ secrets.PROD }}" > terraform/env.tfvars
-          fi
-          echo "Wrote terraform/env.tfvars:"
-          cat terraform/env.tfvars
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init -upgrade
 
-      - name: Terraform Init/Plan/Apply
-        working-directory: terraform
-        env:
-          ARM_USE_OIDC: true
-        run: |
-          terraform init
-          terraform plan -var-file=env.tfvars -out=tfplan
-          terraform apply -auto-approve tfplan
+      - name: Terraform Validate
+        working-directory: ./terraform
+        run: terraform validate
 
-      - name: Extract TF outputs (jq)
-        working-directory: terraform
-        run: |
-          terraform output -json > tfout.json
-          cat tfout.json
-          AKS_NAME=$(jq -r '.aks_cluster_name.value' tfout.json)
-          RG=$(jq -r '.resource_group_name.value // empty' tfout.json)
-          # If RG not output by module, reconstruct from tfvars:
-          if [ -z "$RG" ]; then
-            RG=$(grep -E '^ *resource_group_name' env.tfvars | awk -F\" '{print $2}')
-          fi
-          echo "AKS_NAME=$AKS_NAME" >> $GITHUB_ENV
-          echo "RESOURCE_GROUP=$RG" >> $GITHUB_ENV
+      - name: Terraform Plan
+        id: plan
+        working-directory: ./terraform
+        run: terraform plan -out=tfplan
 
-      - name: Get kubeconfig for AKS
-        run: |
-          az aks get-credentials -n "$AKS_NAME" -g "$RESOURCE_GROUP" --overwrite-existing
-
-      - name: Enable AGIC (Application Gateway Ingress Controller)
-        run: |
-          # Create a simple App Gateway addon (new VNet/subnet is created by AKS if not present)
-          # Adjust names/cidr as you prefer or move into Terraform later.
-          az aks enable-addons \
-            -a ingress-appgw \
-            -n "$AKS_NAME" \
-            -g "$RESOURCE_GROUP" \
-            --appgw-name "${AKS_NAME}-appgw" \
-            --appgw-subnet-cidr "10.225.0.0/16"
-
-      - name: Install Argo CD (Helm)
-        run: |
-          kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
-          helm repo add argo https://argoproj.github.io/argo-helm
-          helm repo update
-          helm upgrade -i argocd argo/argo-cd \
-            --namespace argocd \
-            --wait \
-            --timeout 10m
-
-      - name: Install Sealed-Secrets (Helm)
-        run: |
-          kubectl create namespace sealed-secrets --dry-run=client -o yaml | kubectl apply -f -
-          helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
-          helm repo update
-          helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
-            --namespace sealed-secrets \
-            --wait \
-            --timeout 10m
-
-      - name: Create environment namespaces
-        run: |
-          kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f -
-          kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f -
-          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Bootstrap Root Argo App
-        run: |
-          kubectl apply -f aks-yaml/argocd/root-app.yaml -n argocd
+      - name: Terraform Apply
+        if: ${{ success() }}
+        working-directory: ./terraform
+        run: terraform apply -auto-approve tfplan
