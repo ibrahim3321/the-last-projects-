@@ -1,0 +1,122 @@
+name: Deploy (Seal Secrets & Bootstrap Root App)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment (dev or prod)"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev, prod]
+  push:
+    branches: [ main, feature/ci-cd ]
+    paths:
+      - '.github/workflows/deploy.yml'
+      - 'aks-yaml/argocd/**'
+      - 'aks-yaml/overlays/**'
+      - 'aks-yaml/secrets/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      ENV: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup kubeseal & kubectl
+        run: |
+          sudo wget -qO /usr/local/bin/kubeseal https://github.com/bitnami-labs/sealed-secrets/releases/latest/download/kubeseal-linux-amd64
+          sudo chmod +x /usr/local/bin/kubeseal
+
+      - name: Read AKS info from Terraform outputs
+        working-directory: terraform
+        run: |
+          terraform output -json > tfout.json
+          AKS_NAME=$(jq -r '.aks_cluster_name.value' tfout.json)
+          RG=$(jq -r '.resource_group_name.value // empty' tfout.json)
+          if [ -z "$RG" ]; then
+            # Fallback: parse from tfvars if not in outputs
+            if [ "${{ github.ref_name }}" = "main" ]; then
+              echo "${{ secrets.PROD }}" > env.tfvars
+            else
+              echo "${{ secrets.DEV }}" > env.tfvars
+            fi
+            RG=$(grep -E '^ *resource_group_name' env.tfvars | awk -F\" '{print $2}')
+          fi
+          echo "AKS_NAME=$AKS_NAME" >> $GITHUB_ENV
+          echo "RESOURCE_GROUP=$RG" >> $GITHUB_ENV
+
+      - name: Get kubeconfig for AKS
+        run: |
+          az aks get-credentials -n "$AKS_NAME" -g "$RESOURCE_GROUP" --overwrite-existing
+
+      - name: Fetch Sealed-Secrets public cert
+        run: |
+          kubeseal --fetch-cert \
+            --controller-name=sealed-secrets \
+            --controller-namespace=sealed-secrets > pubcert.pem
+          ls -l pubcert.pem
+
+      # --------- Render & Seal Secrets (env-aware) ----------
+      - name: Prepare secrets directory
+        run: |
+          mkdir -p aks-yaml/overlays/$ENV/sealed
+
+      - name: Write plain secret yamls from GitHub secrets
+        run: |
+          # These secrets contain YAML as you provided.
+          echo '${{ secrets.CALLMEBOT_SECRETS }}' > plain-callmebot.yaml
+          echo '${{ secrets.SLACK_WEBHOOK_SECRETS }}' > plain-slack.yaml
+          echo '${{ secrets.MSSQL_SECRETS }}' > plain-mssql.yaml
+          echo '${{ secrets.GRAFANA_CREDENTILALS }}' > plain-grafana.yaml
+          # Show file list only
+          ls -l plain-*.yaml
+
+      - name: Seal them per namespace
+        run: |
+          # callmebot + slack + grafana live in monitoring
+          kubeseal --format=yaml --cert=pubcert.pem \
+            --namespace monitoring < plain-callmebot.yaml \
+            > aks-yaml/overlays/$ENV/sealed/callmebot-sealed.yaml
+          kubeseal --format=yaml --cert=pubcert.pem \
+            --namespace monitoring < plain-slack.yaml \
+            > aks-yaml/overlays/$ENV/sealed/slack-sealed.yaml
+          kubeseal --format=yaml --cert=pubcert.pem \
+            --namespace monitoring < plain-grafana.yaml \
+            > aks-yaml/overlays/$ENV/sealed/grafana-sealed.yaml
+
+          # mssql-secret lives in app ns (dev or prod)
+          kubeseal --format=yaml --cert=pubcert.pem \
+            --namespace $ENV < plain-mssql.yaml \
+            > aks-yaml/overlays/$ENV/sealed/mssql-sealed.yaml
+
+          ls -l aks-yaml/overlays/$ENV/sealed
+
+      - name: Make sure overlay references sealed secrets
+        run: |
+          FILE="aks-yaml/overlays/$ENV/kustomization.yaml"
+          grep -q '^  - ./sealed$' "$FILE" || \
+            awk '{print} END{print "  - ./sealed"}' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+          cat "$FILE"
+
+      - name: Commit & push sealed secrets
+        run: |
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git add aks-yaml/overlays/$ENV/sealed/*.yaml
+          git add aks-yaml/overlays/$ENV/kustomization.yaml
+          git commit -m "chore($ENV): add/update sealed secrets"
+          git push
+
+      - name: Bootstrap Root Argo App (idempotent)
+        run: |
+          kubectl apply -f aks-yaml/argocd/root-app.yaml -n argocd || true
