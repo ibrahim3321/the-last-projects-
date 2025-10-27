@@ -1,14 +1,5 @@
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: frontend-deployment
-spec:
-  template:
-    spec:
-      containers:
-        - name: frontend
-          image: REPLACED_BY_KUSTOMIZE_FRONTEND
----
+# NOTE: __ACR_FQDN__ is replaced by the Deploy workflow.
+# Default to "latest-prod"; workflow can pin to "${SHA}-prod".
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -18,7 +9,18 @@ spec:
     spec:
       containers:
         - name: backend
-          image: REPLACED_BY_KUSTOMIZE_BACKEND
+          image: __ACR_FQDN__/backend:latest-prod
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: frontend
+          image: __ACR_FQDN__/frontend:latest-prod
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -29,4 +31,4 @@ spec:
     spec:
       containers:
         - name: adapter
-          image: REPLACED_BY_KUSTOMIZE_CALLMEBOT
+          image: __ACR_FQDN__/callmebot-adapter:latest-prod
