@@ -4,15 +4,25 @@ on:
   workflow_run:
     workflows: [ Build Images ]
     types: [ completed ]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Target environment"
+        type: choice
+        required: true
+        options: [dev, prod]
+        default: dev
+      destroy:
+        description: "Run terraform destroy instead of apply"
+        type: boolean
+        default: false
 
 jobs:
   terraform:
-    # run if Build Images finished successfully OR this was manual
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
-      id-token: write    # harmless here; kept for parity across workflows
+      id-token: write
       contents: read
     env:
       TF_IN_AUTOMATION: "true"
@@ -21,83 +31,54 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Choose environment from branch
+      - name: Decide ENV
         id: envsel
         shell: bash
         run: |
-          # If triggered by workflow_run, use its head_branch. Otherwise use ref_name.
-          BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
-          if [ "$BRANCH" = "main" ]; then
-            echo "ENV=prod" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ENV=${{ inputs.env }}" >> "$GITHUB_OUTPUT"
           else
-            echo "ENV=dev" >> "$GITHUB_OUTPUT"
+            BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
+            if [ "$BRANCH" = "main" ]; then echo "ENV=prod" >> "$GITHUB_OUTPUT"; else echo "ENV=dev" >> "$GITHUB_OUTPUT"; fi
           fi
-          echo "Selected ENV=$(cat $GITHUB_OUTPUT | cut -d= -f2)"
 
-      # --- Azure login using SPN JSON (requested) ---
-      - name: 🔐 Azure Login (OIDC/SPN JSON)
+      - name: 🔐 Azure Login (SPN JSON)
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Export ARM_* for Terraform AzureRM provider (works with SPN JSON)
-      - name: Export ARM_* env for Terraform
-        id: arm
-        shell: bash
-        run: |
-          CREDS='${{ secrets.AZURE_CREDENTIALS }}'
-          clientId=$(echo "$CREDS" | jq -r '.clientId')
-          clientSecret=$(echo "$CREDS" | jq -r '.clientSecret')
-          tenantId=$(echo "$CREDS" | jq -r '.tenantId')
-          subscriptionId=$(echo "$CREDS" | jq -r '.subscriptionId')
-
-          {
-            echo "ARM_CLIENT_ID=$clientId"
-            echo "ARM_CLIENT_SECRET=$clientSecret"
-            echo "ARM_TENANT_ID=$tenantId"
-            echo "ARM_SUBSCRIPTION_ID=$subscriptionId"
-            echo "ARM_USE_MSI=false"
-            echo "ARM_USE_OIDC=false"
-          } >> "$GITHUB_ENV"
-
-      - name: Pull external ACR id
+      - name: Fetch ACR id
         id: acr
         shell: bash
         run: |
           ACR_NAME="${{ secrets.ACR_NAME }}"
-          if [ -z "$ACR_NAME" ]; then
-            echo "ACR_NAME secret is missing"; exit 1
-          fi
+          test -n "$ACR_NAME" || { echo "Missing secret ACR_NAME"; exit 1; }
           ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
-          if [ -z "$ACR_ID" ]; then
-            echo "Failed to resolve ACR id for $ACR_NAME"; exit 1
-          fi
+          test -n "$ACR_ID" || { echo "Cannot resolve ACR id"; exit 1; }
           echo "ACR_ID=$ACR_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Export ARM_* for Terraform
+        shell: bash
+        run: |
+          CREDS='${{ secrets.AZURE_CREDENTIALS }}'
+          echo ARM_CLIENT_ID=$(echo "$CREDS" | jq -r '.clientId') >> $GITHUB_ENV
+          echo ARM_CLIENT_SECRET=$(echo "$CREDS" | jq -r '.clientSecret') >> $GITHUB_ENV
+          echo ARM_TENANT_ID=$(echo "$CREDS" | jq -r '.tenantId') >> $GITHUB_ENV
+          echo ARM_SUBSCRIPTION_ID=$(echo "$CREDS" | jq -r '.subscriptionId') >> $GITHUB_ENV
+          echo ARM_USE_OIDC=false >> $GITHUB_ENV
+          echo ARM_USE_MSI=false >> $GITHUB_ENV
 
       - name: Write env.auto.tfvars
         working-directory: ./terraform
         shell: bash
         run: |
           ENV="${{ steps.envsel.outputs.ENV }}"
-          tfvars_file="env.auto.tfvars"
-
-          # Write the environment-specific tfvars body from repo secrets
           if [ "$ENV" = "prod" ]; then
-            printf "%s\n" '${{ secrets.PROD }}' > "$tfvars_file"
+            printf "%s\n" '${{ secrets.PROD }}' > env.auto.tfvars
           else
-            printf "%s\n" '${{ secrets.DEV }}' > "$tfvars_file"
+            printf "%s\n" '${{ secrets.DEV }}' > env.auto.tfvars
           fi
-
-          # Append computed/external values
-          {
-            echo ""
-            echo "# Injected by CI"
-            echo "acr_id = \"${{ steps.acr.outputs.ACR_ID }}\""
-          } >> "$tfvars_file"
-
-          echo "----- $tfvars_file -----"
-          cat "$tfvars_file" | sed 's/=.*/= ***redacted*** /' || true
-          echo "------------------------"
+          echo "acr_id = \"${{ steps.acr.outputs.ACR_ID }}\"" >> env.auto.tfvars
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -118,6 +99,11 @@ jobs:
         run: terraform plan -out=tfplan
 
       - name: Terraform Apply
-        if: ${{ success() }}
+        if: ${{ !inputs.destroy }}
         working-directory: ./terraform
         run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Destroy
+        if: ${{ inputs.destroy }}
+        working-directory: ./terraform
+        run: terraform destroy -auto-approve
