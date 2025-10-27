@@ -1,9 +1,9 @@
 locals {
-  kubernetes_version = "1.33.3"
-  node_pool_name     = "agentpool"
-  node_vm_size       = "Standard_DS2_v2"
-  node_count         = 2
-  log_retention_days = 30
+  kubernetes_version  = "1.33.3"
+  node_pool_name      = "agentpool"
+  node_vm_size        = "Standard_DS2_v2"
+  node_count          = 2
+  log_retention_days  = 30
 }
 
 resource "azurerm_log_analytics_workspace" "law" {
@@ -35,24 +35,12 @@ resource "azurerm_kubernetes_cluster" "aks" {
     network_plugin = "azure"
   }
 
-  dynamic "addon_profile" {
-    for_each = var.enable_agic ? [1] : []
-    content {
-      ingress_application_gateway {
-        enabled     = true
-        subnet_cidr = var.appgw_subnet_cidr
-        gateway_name = coalesce(var.appgw_name, "${var.resource_prefix}-appgw")
-      }
-    }
-  }
-
   tags = {
     environment = var.environment
   }
 
   depends_on = [azurerm_log_analytics_workspace.law]
 }
-
 resource "azurerm_role_assignment" "aks_acr_pull" {
   principal_id         = azurerm_kubernetes_cluster.aks.identity[0].principal_id
   role_definition_name = "AcrPull"
