@@ -6,7 +6,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/ibrahim3321/the-last-projects
+    repoURL: https://github.com/ibrahim3321/the-last-projects-
     targetRevision: main
     path: aks-yaml/overlays/prod
   destination:
