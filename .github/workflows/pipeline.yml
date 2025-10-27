@@ -136,12 +136,11 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # 👇 NEW: Export ARM_* so AzureRM uses SP + client secret (not Azure CLI)
-      - name: Export ARM env for Service Principal (from AZURE_CREDENTIALS)
+      # Use SP + client secret with Terraform (not CLI auth)
+      - name: Export ARM env for Service Principal
         run: |
           sudo apt-get update -y && sudo apt-get install -y jq
           CREDS='${{ secrets.AZURE_CREDENTIALS }}'
-          echo "$CREDS" | jq .
           ARM_CLIENT_ID=$(echo "$CREDS" | jq -r '.clientId // .appId')
           ARM_CLIENT_SECRET=$(echo "$CREDS" | jq -r '.clientSecret // .password')
           ARM_TENANT_ID=$(echo "$CREDS" | jq -r '.tenantId // .tenant')
@@ -151,7 +150,6 @@ jobs:
           echo "ARM_TENANT_ID=$ARM_TENANT_ID" >> $GITHUB_ENV
           echo "ARM_SUBSCRIPTION_ID=$ARM_SUBSCRIPTION_ID" >> $GITHUB_ENV
           echo "ARM_ENVIRONMENT=public" >> $GITHUB_ENV
-        shell: bash
 
       - name: Pull external ACR id
         id: acr
@@ -159,26 +157,29 @@ jobs:
           ACR_ID=$(az acr show -n "${{ secrets.ACR_NAME }}" --query id -o tsv)
           echo "ACR_ID=$ACR_ID" >> $GITHUB_OUTPUT
 
-      - name: Write env.auto.tfvars from secret
+      # ✅ Write JSON tfvars (auto-loaded by Terraform)
+      - name: Write env.auto.tfvars.json from JSON secret
         working-directory: ./terraform
         run: |
           ENV="${{ needs.build.outputs.ENV }}"
           if [ "$ENV" = "prod" ]; then
-            printf "%s\n" '${{ secrets.PROD }}' > env.auto.tfvars
+            RAW='${{ secrets.PROD }}'
           else
-            printf "%s\n" '${{ secrets.DEV }}' > env.auto.tfvars
+            RAW='${{ secrets.DEV }}'
           fi
-          echo 'acr_id = "${{ steps.acr.outputs.ACR_ID }}"' >> env.auto.tfvars
+          # merge acr_id into the JSON and write env.auto.tfvars.json
+          echo "$RAW" | jq --arg acr_id "${{ steps.acr.outputs.ACR_ID }}" '. + {acr_id:$acr_id}' > env.auto.tfvars.json
+          # show only keys for visibility
+          jq -r 'keys[]' env.auto.tfvars.json | sed 's/^/tfvar: /'
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.5
 
-      # If your Terraform backend is azurerm and account keys are disabled,
-      # ensure your backend block includes: use_azuread_auth = true
-      # (and grant Storage Blob Data Owner on the state storage)
-      # https://developer.hashicorp.com/terraform/language/backend/azurerm
+      # If your azurerm backend has storage keys disabled, ensure:
+      #   use_azuread_auth = true
+      # and grant the SP Storage Blob Data Owner on the state account.
 
       - name: Terraform Init/Plan/Apply
         working-directory: ./terraform
@@ -187,17 +188,12 @@ jobs:
           terraform plan -out=tfplan
           terraform apply -auto-approve tfplan
 
-      - name: Resolve AKS RG/name from tfvars
+      - name: Resolve AKS RG/name from tfvars.json
         id: aksnames
+        working-directory: ./terraform
         run: |
-          ENV="${{ needs.build.outputs.ENV }}"
-          if [ "$ENV" = "prod" ]; then
-            printf "%s\n" '${{ secrets.PROD }}' > .tfvars.tmp
-          else
-            printf "%s\n" '${{ secrets.DEV }}' > .tfvars.tmp
-          fi
-          RG=$(grep -E '^\s*resource_group_name' .tfvars.tmp | sed -E 's/.*=\s*"([^"]+)".*/\1/')
-          PREFIX=$(grep -E '^\s*resource_prefix' .tfvars.tmp | sed -E 's/.*=\s*"([^"]+)".*/\1/')
+          RG=$(jq -r '.resource_group_name' env.auto.tfvars.json)
+          PREFIX=$(jq -r '.resource_prefix' env.auto.tfvars.json)
           echo "RG=$RG" >> $GITHUB_OUTPUT
           echo "AKS=${PREFIX}-aks" >> $GITHUB_OUTPUT
 
