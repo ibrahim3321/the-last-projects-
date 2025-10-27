@@ -12,42 +12,59 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
     outputs:
       ENV: ${{ steps.envsel.outputs.ENV }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Choose environment from branch
         id: envsel
+        shell: bash
         run: |
           if [ "${GITHUB_REF##*/}" = "main" ]; then
-            echo "ENV=prod" >> $GITHUB_OUTPUT
+            echo "ENV=prod" >> "$GITHUB_OUTPUT"
           else
-            echo "ENV=dev" >> $GITHUB_OUTPUT
+            echo "ENV=dev" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Azure login (OIDC)
+      # ---- Azure login via client-secret JSON (no OIDC) ----
+      - name: 🔐 Azure Login (client secret JSON)
         uses: azure/login@v2
         with:
-          client-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
-          tenant-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).tenantId }}
-          subscription-id: ${{ fromJSON(secrets.AZURE_CREDENTIALS).subscriptionId }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Derive ACR FQDN and login
         id: acr
         shell: bash
         run: |
+          : "${{ secrets.ACR_NAME?ACR_NAME secret is required}}"
           ACR_NAME="${{ secrets.ACR_NAME }}"
-          echo "ACR=${ACR_NAME}.${REGISTRY_FQDN_SUFFIX}" >> $GITHUB_OUTPUT
+          echo "ACR=${ACR_NAME}.${REGISTRY_FQDN_SUFFIX}" >> "$GITHUB_OUTPUT"
           az acr login --name "${ACR_NAME}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Backend
+      - name: Prepare build metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ steps.acr.outputs.ACR }}/backend
+            ${{ steps.acr.outputs.ACR }}/frontend
+            ${{ steps.acr.outputs.ACR }}/callmebot-adapter
+          tags: |
+            type=raw,value=latest-${{ steps.envsel.outputs.ENV }}
+            type=raw,value=${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+
+      # -------- Backend --------
       - name: Build & push backend
         uses: docker/build-push-action@v5
         with:
@@ -56,8 +73,11 @@ jobs:
           tags: |
             ${{ steps.acr.outputs.ACR }}/backend:latest-${{ steps.envsel.outputs.ENV }}
             ${{ steps.acr.outputs.ACR }}/backend:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/backend:buildcache
+          cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/backend:buildcache,mode=max
 
-      # Frontend
+      # -------- Frontend --------
       - name: Build & push frontend
         uses: docker/build-push-action@v5
         with:
@@ -66,8 +86,11 @@ jobs:
           tags: |
             ${{ steps.acr.outputs.ACR }}/frontend:latest-${{ steps.envsel.outputs.ENV }}
             ${{ steps.acr.outputs.ACR }}/frontend:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/frontend:buildcache
+          cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/frontend:buildcache,mode=max
 
-      # Callmebot adapter
+      # -------- Callmebot adapter --------
       - name: Build & push callmebot-adapter
         uses: docker/build-push-action@v5
         with:
@@ -76,3 +99,6 @@ jobs:
           tags: |
             ${{ steps.acr.outputs.ACR }}/callmebot-adapter:latest-${{ steps.envsel.outputs.ENV }}
             ${{ steps.acr.outputs.ACR }}/callmebot-adapter:${{ github.sha }}-${{ steps.envsel.outputs.ENV }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ steps.acr.outputs.ACR }}/callmebot-adapter:buildcache
+          cache-to: type=registry,ref=${{ steps.acr.outputs.ACR }}/callmebot-adapter:buildcache,mode=max
