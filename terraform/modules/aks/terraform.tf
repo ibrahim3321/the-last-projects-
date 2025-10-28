@@ -1,7 +1,7 @@
 locals {
   kubernetes_version = "1.33.3"
   node_pool_name     = "agentpool"
-  node_vm_size       = "Standard_DS2_v2"
+  node_vm_size       = "Standard_DS2_v6"
   node_count         = 2
   log_retention_days = 30
 }
