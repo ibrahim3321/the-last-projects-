@@ -191,32 +191,6 @@ jobs:
           echo "RG=$RG" >> $GITHUB_OUTPUT
           echo "AKS=${PREFIX}-aks" >> $GITHUB_OUTPUT
 
-      - name: (Optional) Enable AGIC (auto-create AppGW/UAMI in MC_* RG)
-        if: ${{ github.event.inputs.enable_agic == 'yes' || github.event_name != 'workflow_dispatch' }}
-        env:
-          AKS_RG:  ${{ steps.aksnames.outputs.RG }}
-          AKS_NAME: ${{ steps.aksnames.outputs.AKS }}
-        run: |
-          set -euo pipefail
-          ADDONS=$(az aks show -g "$AKS_RG" -n "$AKS_NAME" --query "addonProfiles" -o json)
-          if echo "$ADDONS" | jq -e '.ingressApplicationGateway.enabled == true' >/dev/null 2>&1; then
-            echo "AGIC already enabled — nothing to do."
-            exit 0
-          fi
-          az aks enable-addons \
-            -a ingress-appgw \
-            -g "$AKS_RG" -n "$AKS_NAME" \
-            --appgw-name "${AKS_NAME}-appgw" \
-            --appgw-subnet-cidr "10.225.0.0/16" || {
-              echo "Retrying enable-addons…"
-              az aks disable-addons -a ingress-appgw -g "$AKS_RG" -n "$AKS_NAME" || true
-              az aks enable-addons \
-                -a ingress-appgw \
-                -g "$AKS_RG" -n "$AKS_NAME" \
-                --appgw-name "${AKS_NAME}-appgw" \
-                --appgw-subnet-cidr "10.225.0.0/16"
-            }
-
   deploy:
     needs: [infra, build]
     runs-on: ubuntu-latest
@@ -243,12 +217,13 @@ jobs:
 
       - name: Install tools (helm, kubeseal, yq, kustomize) — resilient
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}   # optional: avoids GitHub API rate limits
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
           sudo snap install helm --classic
           sudo apt-get update -y && sudo apt-get install -y jq
-          ARCH="$(uname -m)"; case "$ARCH" in
+          ARCH="$(uname -m)"
+          case "$ARCH" in
             x86_64) ARCH="amd64" ;;
             aarch64|arm64) ARCH="arm64" ;;
             *) echo "Unsupported arch: $(uname -m)"; exit 1 ;;
@@ -256,8 +231,7 @@ jobs:
           if [ -n "${GH_TOKEN:-}" ]; then AUTH_H="-H Authorization: Bearer $GH_TOKEN"; else AUTH_H=""; fi
           API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest"
           DL_URL="$(curl -fsSL $AUTH_H -H 'Accept: application/vnd.github+json' "$API_URL" \
-            | jq -r ".assets[]?.browser_download_url | select(test(\"kubeseal-.*-linux-${ARCH}(\\\\.tar\\\\.gz)?$\"))" \
-            | head -n1 || true)"
+            | jq -r ".assets[]?.browser_download_url | select(test(\"kubeseal-.*-linux-${ARCH}(\\\\.tar\\\\.gz)?$\"))" | head -n1 || true)"
           if [ -n "$DL_URL" ]; then
             FNAME="${DL_URL##*/}"
             curl -fsSL -o "$FNAME" "$DL_URL"
@@ -287,54 +261,87 @@ jobs:
 
       - name: Install Sealed-Secrets controller
         run: |
-          set -euo pipefail
           helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
           helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
             --namespace kube-system --create-namespace --wait --timeout 10m
 
       - name: Fetch Sealed-Secrets cert
-        run: |
-          set -euo pipefail
-          kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
+        run: kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
 
       - name: Prepare env folder
-        run: |
-          set -euo pipefail
-          mkdir -p "aks-yaml/secrets/${{ needs.build.outputs.ENV }}"
-
-      - name: Write plain Secret yamls (from repo secrets)
-        run: |
-          set -euo pipefail
-          printf "%s\n" '${{ secrets.SLACK_WEBHOOK_SECRETS }}' > /tmp/slack.yaml
-          printf "%s\n" '${{ secrets.CALLMEBOT_SECRETS }}'     > /tmp/callmebot.yaml
-          printf "%s\n" '${{ secrets.MSSQL_SECRETS }}'         > /tmp/mssql.yaml
-          printf "%s\n" '${{ secrets.GRAFANA_CREDENTILALS }}'  > /tmp/grafana.yaml
+        run: mkdir -p "aks-yaml/secrets/${{ needs.build.outputs.ENV }}"
 
       - name: Seal secrets → commit
+        env:
+          ENV:            ${{ needs.build.outputs.ENV }}
+          SLACK_RAW:      ${{ secrets.SLACK_WEBHOOK_SECRETS }}
+          CALLMEBOT_RAW:  ${{ secrets.CALLMEBOT_SECRETS }}
+          MSSQL_RAW:      ${{ secrets.MSSQL_SECRETS }}
+          GRAFANA_RAW:    ${{ secrets.GRAFANA_CREDENTILALS }}
         run: |
           set -euo pipefail
-          ENV="${{ needs.build.outputs.ENV }}"
-          for s in slack callmebot mssql grafana; do
-            kubeseal --format yaml --cert pubcert.pem < "/tmp/${s}.yaml" > "aks-yaml/secrets/${ENV}/${s}-sealed.yaml"
+          norm() { tr -d '\r' <<<"$1"; }
+          write_secret_manifest() {
+            local NAME="$1" NS="$2" RAW
+            RAW="$(norm "$3")"
+            if [ -z "$RAW" ] || [ "$RAW" = "null" ]; then
+              echo "::warning::Secret ${NAME} is empty, skipping."
+              return
+            fi
+            local OUT="/tmp/${NAME}.yaml"
+            if grep -qE '^apiVersion:' <<<"$RAW" && grep -qE '^kind:\s*Secret' <<<"$RAW"; then
+              awk -v ns="$NS" '
+                /^metadata:/ {print; seen=1; next}
+                seen==1 && !p && $0 ~ /^  namespace:/ {p=1}
+                {print}
+                END { if (seen && !p) print "  namespace: " ns }
+              ' <<<"$RAW" > "$OUT"
+            elif jq -e . >/dev/null 2>&1 <<<"$RAW"; then
+              {
+                echo "apiVersion: v1"
+                echo "kind: Secret"
+                echo "metadata:"
+                echo "  name: ${NAME}"
+                echo "  namespace: ${NS}"
+                echo "type: Opaque"
+                echo "stringData:"
+                jq -r 'to_entries[] | "  \(.key): |\n    \(.value|tostring)"' <<<"$RAW"
+              } > "$OUT"
+            else
+              {
+                echo "apiVersion: v1"
+                echo "kind: Secret"
+                echo "metadata:"
+                echo "  name: ${NAME}"
+                echo "  namespace: ${NS}"
+                echo "type: Opaque"
+                echo "stringData:"
+                while IFS= read -r line; do
+                  [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+                  [[ "$line" =~ ^# ]] && continue
+                  if [[ "$line" =~ ^[^=[:space:]]+= ]]; then
+                    key="${line%%=*}"; val="${line#*=}"
+                    printf '  %s: |\n    %s\n' "$key" "$val"
+                  fi
+                done <<<"$RAW"
+              } > "$OUT"
+            fi
+          }
+          write_secret_manifest slack-webhook-url monitoring "$SLACK_RAW"
+          write_secret_manifest callmebot-config monitoring "$CALLMEBOT_RAW"
+          write_secret_manifest mssql-secret default "$MSSQL_RAW"
+          write_secret_manifest grafana-admin-credentials monitoring "$GRAFANA_RAW"
+          mkdir -p "aks-yaml/secrets/${ENV}"
+          for f in /tmp/*.yaml; do
+            [ -e "$f" ] || { echo "No secrets generated."; break; }
+            base="$(basename "$f" .yaml)"
+            kubeseal --format yaml --cert pubcert.pem < "$f" > "aks-yaml/secrets/${ENV}/${base}-sealed.yaml"
+            echo "sealed: ${base}"
           done
           git config user.email "github-actions@users.noreply.github.com"
           git config user.name "github-actions"
           git add "aks-yaml/secrets/${ENV}" || true
           git commit -m "ci: sealed-secrets (${ENV}) [skip ci]" || echo "No changes"
-          git push || true
-
-      - name: Patch image registry & tag in overlay
-        run: |
-          set -euo pipefail
-          ENV="${{ needs.build.outputs.ENV }}"
-          ACR_FQDN="${{ needs.build.outputs.ACR_FQDN }}"
-          PATCH="aks-yaml/overlays/${ENV}/patch-images.yaml"
-          sed -i "s#__ACR_FQDN__#${ACR_FQDN}#g" "$PATCH"
-          if [ "${{ github.event.inputs.pin_sha || 'yes' }}" = "yes" ]; then
-            sed -i "s#latest-${ENV}#${{ needs.build.outputs.IMAGE_TAG_SUFFIX }}#g" "$PATCH"
-          fi
-          git add "$PATCH" || true
-          git commit -m "ci: image pin for ${ENV} [skip ci]" || echo "No changes"
           git push || true
 
       - name: Install Argo CD (Helm)
