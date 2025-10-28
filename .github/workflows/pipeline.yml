@@ -301,10 +301,10 @@ jobs:
       - name: Build & seal Secrets from JSON GitHub Secrets
         env:
           ENV:          ${{ needs.build.outputs.ENV }}
-          SLACK_RAW:    ${{ secrets.SLACK_WEBHOOK_SECRETS }}   # namespace: monitoring
-          CALLMEBOT_RAW:${{ secrets.CALLMEBOT_SECRETS }}       # namespace: monitoring
-          MSSQL_RAW:    ${{ secrets.MSSQL_SECRETS }}           # namespace: default
-          GRAFANA_RAW:  ${{ secrets.GRAFANA_CREDENTILALS }}    # namespace: monitoring
+          SLACK_RAW:    ${{ secrets.SLACK_WEBHOOK_SECRETS }}   
+          CALLMEBOT_RAW: ${{ secrets.CALLMEBOT_SECRETS }}       
+          MSSQL_RAW:    ${{ secrets.MSSQL_SECRETS }}           
+          GRAFANA_RAW:  ${{ secrets.GRAFANA_CREDENTILALS }}    
         run: |
           set -euo pipefail
 
