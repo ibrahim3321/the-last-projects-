@@ -24,7 +24,7 @@
    environment               = var.environment
    resource_prefix           = var.resource_prefix
    aks_resource_group_name   = module.resourcegroups.resource_group_name 
-+  aks_cluster_name          = module.aks.aks_cluster_name
+   aks_cluster_name          = module.aks.aks_cluster_name
    aks_principal_id          = module.aks.aks_principal_id
    depends_on = [module.aks, module.resourcegroups]
  }
