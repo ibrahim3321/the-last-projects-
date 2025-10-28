@@ -191,7 +191,7 @@ jobs:
     permissions: { contents: write }
     env:
       ENV: ${{ needs.build.outputs.ENV }}
-      ACR_FQDN: ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}   # ← no outputs needed
+      ACR_FQDN: ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}   # ← no outdputs needed
     steps:
       - uses: actions/checkout@v4
 
