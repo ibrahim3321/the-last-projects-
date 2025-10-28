@@ -1,4 +1,4 @@
-name: CI → Infra → Deploy (branch-friendly)
+name: CI → Infra → Deploy (branch-friendly-1)
 
 on:
   push:
