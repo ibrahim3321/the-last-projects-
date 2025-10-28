@@ -1,4 +1,4 @@
-name: CI → Infra → Deploy (branch-friendly)
+name: CI → Infra → Deploy (branch-friendly, clear)
 
 on:
   push:
@@ -16,7 +16,7 @@ on:
         options: [ "yes", "no" ]
         default: "yes"
       pin_sha:
-        description: "Pin images to current commit SHA"
+        description: "Pin images to current commit SHA instead of latest-<env>"
         type: choice
         options: [ "yes", "no" ]
         default: "yes"
@@ -25,12 +25,13 @@ env:
   REGISTRY_FQDN_SUFFIX: azurecr.io
 
 jobs:
-  select-env:
+  choose-environment:
+    name: Choose environment (dev/prod)
     runs-on: ubuntu-latest
     outputs:
       ENV: ${{ steps.pick.outputs.ENV }}
     steps:
-      - name: Choose environment
+      - name: Decide env from dispatch or branch
         id: pick
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.env }}" ]; then
@@ -42,43 +43,44 @@ jobs:
               *) ENV=dev ;;
             esac
           fi
-          echo "ENV=$ENV" >> $GITHUB_OUTPUT
+          echo "ENV=$ENV" >> "$GITHUB_OUTPUT"
           echo "Selected ENV=$ENV"
 
-  build:
-    needs: [select-env]
+  build-images:
+    name: Build & Push Images
+    needs: [choose-environment]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     outputs:
+      ENV: ${{ needs.choose-environment.outputs.ENV }}
       ACR_FQDN: ${{ steps.acr.outputs.ACR_FQDN }}
       IMAGE_TAG_SUFFIX: ${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
-      ENV: ${{ needs.select-env.outputs.ENV }}
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Azure Login
+      - name: Azure login (SP with secret)
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Derive ACR FQDN and login
+      - name: Resolve ACR FQDN + docker login
         id: acr
         run: |
           set -euo pipefail
           ACR_NAME="${{ secrets.ACR_NAME }}"
-          echo "ACR_FQDN=${ACR_NAME}.${REGISTRY_FQDN_SUFFIX}" >> $GITHUB_OUTPUT
-          az acr login --name "${ACR_NAME}"
+          echo "ACR_FQDN=${ACR_NAME}.${REGISTRY_FQDN_SUFFIX}" >> "$GITHUB_OUTPUT"
+          az acr login --name "$ACR_NAME"
 
-      - name: Set up Docker Buildx
+      - name: Enable Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Metadata (labels/tags)
+      - name: Compose image tag suffix
         id: meta
         run: |
-          echo "IMAGE_TAG_SUFFIX=${GITHUB_SHA}-${{ needs.select-env.outputs.ENV }}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG_SUFFIX=${GITHUB_SHA}-${{ needs.choose-environment.outputs.ENV }}" >> "$GITHUB_OUTPUT"
 
       - name: Build & push backend
         uses: docker/build-push-action@v5
@@ -86,7 +88,7 @@ jobs:
           context: ./backend
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR_FQDN }}/backend:latest-${{ needs.select-env.outputs.ENV }}
+            ${{ steps.acr.outputs.ACR_FQDN }}/backend:latest-${{ needs.choose-environment.outputs.ENV }}
             ${{ steps.acr.outputs.ACR_FQDN }}/backend:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/backend:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/backend:buildcache,mode=max
@@ -97,7 +99,7 @@ jobs:
           context: ./frontend
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR_FQDN }}/frontend:latest-${{ needs.select-env.outputs.ENV }}
+            ${{ steps.acr.outputs.ACR_FQDN }}/frontend:latest-${{ needs.choose-environment.outputs.ENV }}
             ${{ steps.acr.outputs.ACR_FQDN }}/frontend:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/frontend:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/frontend:buildcache,mode=max
@@ -108,13 +110,14 @@ jobs:
           context: ./aks-yaml/callmebot
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR_FQDN }}/callmebot-adapter:latest-${{ needs.select-env.outputs.ENV }}
+            ${{ steps.acr.outputs.ACR_FQDN }}/callmebot-adapter:latest-${{ needs.choose-environment.outputs.ENV }}
             ${{ steps.acr.outputs.ACR_FQDN }}/callmebot-adapter:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/callmebot-adapter:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/callmebot-adapter:buildcache,mode=max
 
-  infra:
-    needs: [build]
+  provision-infra:
+    name: Terraform — ACR RBAC + AKS + dependencies
+    needs: [build-images]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -122,58 +125,52 @@ jobs:
     env:
       TF_IN_AUTOMATION: "true"
     outputs:
-      AKS_NAME: ${{ steps.aksnames.outputs.AKS }}
       RG_NAME:  ${{ steps.aksnames.outputs.RG }}
+      AKS_NAME: ${{ steps.aksnames.outputs.AKS }}
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Azure Login
+      - name: Azure login (SP with secret)
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Export ARM env for Service Principal (Terraform)
+      - name: Export ARM_* for Terraform (Service Principal auth)
         run: |
           set -euo pipefail
           sudo apt-get update -y && sudo apt-get install -y jq
           CREDS='${{ secrets.AZURE_CREDENTIALS }}'
-          ARM_CLIENT_ID=$(echo "$CREDS" | jq -r '.clientId // .appId')
-          ARM_CLIENT_SECRET=$(echo "$CREDS" | jq -r '.clientSecret // .password')
-          ARM_TENANT_ID=$(echo "$CREDS" | jq -r '.tenantId // .tenant')
-          ARM_SUBSCRIPTION_ID=$(echo "$CREDS" | jq -r '.subscriptionId // .subscription')
-          echo "ARM_CLIENT_ID=$ARM_CLIENT_ID" >> $GITHUB_ENV
-          echo "ARM_CLIENT_SECRET=$ARM_CLIENT_SECRET" >> $GITHUB_ENV
-          echo "ARM_TENANT_ID=$ARM_TENANT_ID" >> $GITHUB_ENV
-          echo "ARM_SUBSCRIPTION_ID=$ARM_SUBSCRIPTION_ID" >> $GITHUB_ENV
+          echo "ARM_CLIENT_ID=$(echo "$CREDS" | jq -r '.clientId // .appId')" >> $GITHUB_ENV
+          echo "ARM_CLIENT_SECRET=$(echo "$CREDS" | jq -r '.clientSecret // .password')" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=$(echo "$CREDS" | jq -r '.tenantId // .tenant')" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=$(echo "$CREDS" | jq -r '.subscriptionId // .subscription')" >> $GITHUB_ENV
           echo "ARM_ENVIRONMENT=public" >> $GITHUB_ENV
 
-      - name: Pull external ACR id
+      - name: Get ACR resource id (external ACR)
         id: acr
         run: |
           set -euo pipefail
           ACR_ID=$(az acr show -n "${{ secrets.ACR_NAME }}" --query id -o tsv)
-          echo "ACR_ID=$ACR_ID" >> $GITHUB_OUTPUT
+          echo "ACR_ID=$ACR_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Write env.auto.tfvars.json from JSON secret
+      - name: Write env.auto.tfvars.json (from DEV/PROD JSON secrets)
         working-directory: ./terraform
         run: |
           set -euo pipefail
-          ENV="${{ needs.build.outputs.ENV }}"
-          if [ "$ENV" = "prod" ]; then
-            RAW='${{ secrets.PROD }}'
-          else
-            RAW='${{ secrets.DEV }}'
-          fi
+          ENV="${{ needs.build-images.outputs.ENV }}"
+          RAW='${{ secrets.DEV }}'
+          if [ "$ENV" = "prod" ]; then RAW='${{ secrets.PROD }}'; fi
+          # Merge acr_id into the JSON tfvars
           echo "$RAW" | jq --arg acr_id "${{ steps.acr.outputs.ACR_ID }}" '. + {acr_id:$acr_id}' > env.auto.tfvars.json
           jq -r 'keys[]' env.auto.tfvars.json | sed 's/^/tfvar: /'
 
-      - name: Setup Terraform
+      - name: Setup Terraform 1.9.5
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.5
 
-      - name: Terraform Init/Plan/Apply
+      - name: Terraform init/plan/apply
         working-directory: ./terraform
         run: |
           set -euo pipefail
@@ -181,120 +178,125 @@ jobs:
           terraform plan -out=tfplan
           terraform apply -auto-approve tfplan
 
-      - name: Resolve AKS RG/name from tfvars.json
+      - name: Read AKS name & RG from tfvars.json
         id: aksnames
         working-directory: ./terraform
         run: |
           set -euo pipefail
           RG=$(jq -r '.resource_group_name' env.auto.tfvars.json)
           PREFIX=$(jq -r '.resource_prefix' env.auto.tfvars.json)
-          echo "RG=$RG" >> $GITHUB_OUTPUT
-          echo "AKS=${PREFIX}-aks" >> $GITHUB_OUTPUT
+          echo "RG=$RG"   >> "$GITHUB_OUTPUT"
+          echo "AKS=${PREFIX}-aks" >> "$GITHUB_OUTPUT"
 
-  deploy:
-    needs: [infra, build]
+      - name: Optionally enable AGIC on AKS
+        if: ${{ github.event.inputs.enable_agic == 'yes' || github.event_name != 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          az aks enable-addons \
+            -a ingress-appgw \
+            -n "${{ steps.aksnames.outputs.AKS }}" \
+            -g "${{ steps.aksnames.outputs.RG }}" \
+            --appgw-name "${{ steps.aksnames.outputs.AKS }}-appgw" \
+            --appgw-subnet-cidr "10.225.0.0/16"
+
+  deploy-platform:
+    name: Platform Deploy (Secrets → Argo CD → Apps)
+    needs: [provision-infra, build-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    env:
-      REGISTRY_FQDN_SUFFIX: azurecr.io
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Azure Login
+      - name: Azure login (SP with secret)
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Get AKS kubeconfig
+      - name: Get AKS kubeconfig (admin)
         run: |
           set -euo pipefail
           az aks get-credentials \
-            -g "${{ needs.infra.outputs.RG_NAME }}" \
-            -n "${{ needs.infra.outputs.AKS_NAME }}" \
+            -g "${{ needs.provision-infra.outputs.RG_NAME }}" \
+            -n "${{ needs.provision-infra.outputs.AKS_NAME }}" \
             --admin --overwrite-existing
 
       - name: Install tools (helm, kubeseal, yq, kustomize) — resilient
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }} # optional, reduces GitHub API limits
         run: |
           set -euo pipefail
+          # Helm
           sudo snap install helm --classic
-          sudo apt-get update -y && sudo apt-get install -y jq
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64) ARCH="amd64" ;;
-            aarch64|arm64) ARCH="arm64" ;;
-            *) echo "Unsupported arch: $(uname -m)"; exit 1 ;;
-          esac
+
+          # Arch mapping
+          ARCH="$(uname -m)"; case "$ARCH" in x86_64) ARCH="amd64";; aarch64|arm64) ARCH="arm64";; *) echo "Unsupported arch: $ARCH"; exit 1;; esac
+
+          # kubeseal (try API → fallback)
           if [ -n "${GH_TOKEN:-}" ]; then AUTH_H="-H Authorization: Bearer $GH_TOKEN"; else AUTH_H=""; fi
           API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest"
-          DL_URL="$(curl -fsSL $AUTH_H -H 'Accept: application/vnd.github+json' "$API_URL" \
-            | jq -r ".assets[]?.browser_download_url | select(test(\"kubeseal-.*-linux-${ARCH}(\\\\.tar\\\\.gz)?$\"))" | head -n1 || true)"
+          DL_URL="$(curl -fsSL $AUTH_H "$API_URL" | jq -r ".assets[]?.browser_download_url | select(test(\"kubeseal-.*-linux-${ARCH}$\"))" | head -n1 || true)"
           if [ -n "$DL_URL" ]; then
-            FNAME="${DL_URL##*/}"
-            curl -fsSL -o "$FNAME" "$DL_URL"
-            if [[ "$FNAME" == *.tar.gz ]]; then
-              tar -xzf "$FNAME"
-              BIN="$(tar -tzf "$FNAME" | grep -E '(^|/)(kubeseal)$' | awk -F/ '{print $NF}' | head -n1 || true)"
-              [ -z "$BIN" ] && BIN="kubeseal"
-              sudo install -m 0755 "$BIN" /usr/local/bin/kubeseal
-            else
-              sudo install -m 0755 "$FNAME" /usr/local/bin/kubeseal
-            fi
+            curl -fsSL -o kubeseal "$DL_URL"
           else
-            FALLBACK="https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.26.1/kubeseal-0.26.1-linux-${ARCH}.tar.gz"
-            curl -fsSL -o kubeseal.tgz "$FALLBACK"
-            tar -xzf kubeseal.tgz
-            sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
+            echo "Latest asset not found; falling back to v0.26.1"
+            curl -fsSL -o kubeseal "https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.26.1/kubeseal-0.26.1-linux-${ARCH}"
           fi
+          sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
           kubeseal --version
+
+          # yq
           sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_${ARCH}"
           sudo chmod +x /usr/local/bin/yq
           yq --version
+
+          # kustomize
           KUSTOMIZE_VERSION="5.4.2"
           curl -fsSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz"
           tar -xzf kustomize.tar.gz
           sudo install -m 0755 kustomize /usr/local/bin/kustomize
           kustomize version
 
-      - name: Install Sealed-Secrets controller
+      - name: Install Sealed-Secrets controller (Helm)
         run: |
+          set -euo pipefail
           helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
           helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
             --namespace kube-system --create-namespace --wait --timeout 10m
 
-      - name: Fetch Sealed-Secrets cert
-        run: kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
-
-      - name: Prepare env folder
-        run: mkdir -p "aks-yaml/secrets/${{ needs.build.outputs.ENV }}"
-
-      - name: Seal secrets → commit
-        env:
-          ENV:            ${{ needs.build.outputs.ENV }}
-          SLACK_RAW:      ${{ secrets.SLACK_WEBHOOK_SECRETS }}
-          CALLMEBOT_RAW:  ${{ secrets.CALLMEBOT_SECRETS }}
-          MSSQL_RAW:      ${{ secrets.MSSQL_SECRETS }}
-          GRAFANA_RAW:    ${{ secrets.GRAFANA_CREDENTILALS }}
+      - name: Fetch Sealed-Secrets public cert
         run: |
           set -euo pipefail
+          kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
+
+      - name: Build & seal Secrets from JSON GitHub Secrets
+        env:
+          ENV:                    ${{ needs.build-images.outputs.ENV }}
+          SLACK_RAW:             ${{ secrets.SLACK_WEBHOOK_SECRETS }}
+          CALLMEBOT_RAW:         ${{ secrets.CALLMEBOT_SECRETS }}
+          MSSQL_RAW:             ${{ secrets.MSSQL_SECRETS }}
+          GRAFANA_RAW:           ${{ secrets.GRAFANA_CREDENTILALS }}
+        run: |
+          set -euo pipefail
+
           norm() { tr -d '\r' <<<"$1"; }
-          write_secret_manifest() {
-            local NAME="$1" NS="$2" RAW
+
+          write_secret_manifest () {
+            local NAME="$1" NS="$2" RAW OUT
             RAW="$(norm "$3")"
             if [ -z "$RAW" ] || [ "$RAW" = "null" ]; then
-              echo "::warning::Secret ${NAME} is empty, skipping."
-              return
+              echo "::warning title=${NAME}::GitHub secret is empty; skipping."
+              return 0
             fi
-            local OUT="/tmp/${NAME}.yaml"
-            if grep -qE '^apiVersion:' <<<"$RAW" && grep -qE '^kind:\s*Secret' <<<"$RAW"; then
+            OUT="/tmp/${NAME}.yaml"
+            if grep -qE '^apiVersion:\s*v1' <<<"$RAW" && grep -qE '^kind:\s*Secret' <<<"$RAW"; then
+              # Already a Secret YAML; ensure namespace exists
               awk -v ns="$NS" '
-                /^metadata:/ {print; seen=1; next}
-                seen==1 && !p && $0 ~ /^  namespace:/ {p=1}
+                /^metadata:/ {print; m=1; next}
+                m==1 && !p && $0 ~ /^  namespace:/ {p=1}
                 {print}
-                END { if (seen && !p) print "  namespace: " ns }
+                END { if (m && !p) print "  namespace: " ns }
               ' <<<"$RAW" > "$OUT"
             elif jq -e . >/dev/null 2>&1 <<<"$RAW"; then
               {
@@ -326,44 +328,135 @@ jobs:
                 done <<<"$RAW"
               } > "$OUT"
             fi
+            grep -q '^kind: Secret' "$OUT" || { echo "::error::Failed to build Secret for ${NAME}"; exit 1; }
           }
-          write_secret_manifest slack-webhook-url monitoring "$SLACK_RAW"
-          write_secret_manifest callmebot-config monitoring "$CALLMEBOT_RAW"
-          write_secret_manifest mssql-secret default "$MSSQL_RAW"
+
+          # Namespaces: monitoring for 3, default for MSSQL (as you specified)
+          write_secret_manifest slack-webhook-url         monitoring "$SLACK_RAW"
+          write_secret_manifest callmebot-config          monitoring "$CALLMEBOT_RAW"
           write_secret_manifest grafana-admin-credentials monitoring "$GRAFANA_RAW"
+          write_secret_manifest mssql-secret              default    "$MSSQL_RAW"
+
           mkdir -p "aks-yaml/secrets/${ENV}"
+          shopt -s nullglob
           for f in /tmp/*.yaml; do
-            [ -e "$f" ] || { echo "No secrets generated."; break; }
             base="$(basename "$f" .yaml)"
             kubeseal --format yaml --cert pubcert.pem < "$f" > "aks-yaml/secrets/${ENV}/${base}-sealed.yaml"
             echo "sealed: ${base}"
           done
+
           git config user.email "github-actions@users.noreply.github.com"
           git config user.name "github-actions"
           git add "aks-yaml/secrets/${ENV}" || true
           git commit -m "ci: sealed-secrets (${ENV}) [skip ci]" || echo "No changes"
           git push || true
 
+      - name: Patch overlays with ACR + image tag
+        run: |
+          set -euo pipefail
+          ENV="${{ needs.build-images.outputs.ENV }}"
+          ACR_FQDN="${{ needs.build-images.outputs.ACR_FQDN }}"
+          PATCH="aks-yaml/overlays/${ENV}/patch-images.yaml"
+          sed -i "s#__ACR_FQDN__#${ACR_FQDN}#g" "$PATCH"
+          if [ "${{ github.event.inputs.pin_sha || 'yes' }}" = "yes" ]; then
+            sed -i "s#latest-${ENV}#${{ needs.build-images.outputs.IMAGE_TAG_SUFFIX }}#g" "$PATCH"
+          fi
+          git add "$PATCH" || true
+          git commit -m "ci: pin images for ${ENV} [skip ci]" || echo "No changes"
+          git push || true
+
       - name: Install Argo CD (Helm)
         run: |
           set -euo pipefail
           helm repo add argo https://argoproj.github.io/argo-helm
-          helm upgrade -i argocd argo/argo-cd \
-            --namespace argocd --create-namespace \
-            --values aks-yaml/ansible-monitoring-aks/values-argocd.yaml \
-            --wait --timeout 10m
+          # If you keep values file, set the correct path; else install with defaults
+          if [ -f aks-yaml/ansible-monitoring-aks/values-argocd.yaml ]; then
+            helm upgrade -i argocd argo/argo-cd \
+              --namespace argocd --create-namespace \
+              --values aks-yaml/ansible-monitoring-aks/values-argocd.yaml \
+              --wait --timeout 10m
+          else
+            helm upgrade -i argocd argo/argo-cd \
+              --namespace argocd --create-namespace \
+              --wait --timeout 10m
+          fi
 
-      - name: Bootstrap Argo applications
+      - name: Bootstrap ArgoCD Applications (secrets + apps)
         run: |
           set -euo pipefail
-          ENV="${{ needs.build.outputs.ENV }}"
+          ENV="${{ needs.build-images.outputs.ENV }}"
+
+          # Fix YAML in Application manifests if needed (spaces after keys)
+          # Repo URL must be valid
+          REPO_URL="https://github.com/ibrahim3321/the-last-projects-"
+
+          # Ensure both app definitions exist; create minimal ones if missing
+          mkdir -p aks-yaml/argocd
+
           if [ "$ENV" = "prod" ]; then
-            kubectl apply -f aks-yaml/argocd/app-secrets-prod.yaml
-            kubectl apply -f aks-yaml/argocd/app-prod.yaml
+            APP_SECRETS="aks-yaml/argocd/app-secrets-prod.yaml"
+            APP_APPS="aks-yaml/argocd/app-prod.yaml"
+            SECRETS_PATH="aks-yaml/secrets/prod"
+            OVERLAY_PATH="aks-yaml/overlays/prod"
+            BRANCH="main"
           else
-            kubectl apply -f aks-yaml/argocd/app-secrets-dev.yaml
-            kubectl apply -f aks-yaml/argocd/app-dev.yaml
+            APP_SECRETS="aks-yaml/argocd/app-secrets-dev.yaml"
+            APP_APPS="aks-yaml/argocd/app-dev.yaml"
+            SECRETS_PATH="aks-yaml/secrets/dev"
+            OVERLAY_PATH="aks-yaml/overlays/dev"
+            BRANCH="feature/ci-cd"
           fi
+
+          # Application for sealed secrets folder
+          cat > "$APP_SECRETS" <<YAML
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: secrets-${ENV}
+            namespace: argocd
+          spec:
+            project: default
+            source:
+              repoURL: ${REPO_URL}
+              targetRevision: ${BRANCH}
+              path: ${SECRETS_PATH}
+              directory:
+                recurse: true
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: argocd
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+            revisionHistoryLimit: 2
+          YAML
+
+          # Application for kustomize overlay (apps)
+          cat > "$APP_APPS" <<YAML
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: app-${ENV}
+            namespace: argocd
+          spec:
+            project: default
+            source:
+              repoURL: ${REPO_URL}
+              targetRevision: ${BRANCH}
+              path: ${OVERLAY_PATH}
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: default
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+            revisionHistoryLimit: 2
+          YAML
+
+          kubectl apply -f "$APP_SECRETS"
+          kubectl apply -f "$APP_APPS"
 
       - name: Show ArgoCD Applications
         run: kubectl get applications.argoproj.io -A
