@@ -136,7 +136,7 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Use SP + client secret with Terraform (not CLI auth)
+      # Use SP + client secret with Terraform (not CLI-as-user)
       - name: Export ARM env for Service Principal
         run: |
           sudo apt-get update -y && sudo apt-get install -y jq
@@ -157,7 +157,7 @@ jobs:
           ACR_ID=$(az acr show -n "${{ secrets.ACR_NAME }}" --query id -o tsv)
           echo "ACR_ID=$ACR_ID" >> $GITHUB_OUTPUT
 
-      # ✅ Write JSON tfvars (auto-loaded by Terraform)
+      # Write JSON tfvars (auto-loaded by Terraform) + merge acr_id
       - name: Write env.auto.tfvars.json from JSON secret
         working-directory: ./terraform
         run: |
@@ -167,7 +167,6 @@ jobs:
           else
             RAW='${{ secrets.DEV }}'
           fi
-          # merge acr_id into the JSON and write env.auto.tfvars.json
           echo "$RAW" | jq --arg acr_id "${{ steps.acr.outputs.ACR_ID }}" '. + {acr_id:$acr_id}' > env.auto.tfvars.json
           # show only keys for visibility
           jq -r 'keys[]' env.auto.tfvars.json | sed 's/^/tfvar: /'
@@ -177,7 +176,7 @@ jobs:
         with:
           terraform_version: 1.9.5
 
-      # If your azurerm backend has storage keys disabled, ensure:
+      # If your azurerm backend has account keys disabled:
       #   use_azuread_auth = true
       # and grant the SP Storage Blob Data Owner on the state account.
 
@@ -307,6 +306,7 @@ jobs:
             kubectl apply -f aks-yaml/argocd/app-secrets-dev.yaml
             kubectl apply -f aks-yaml/argocd/app-dev.yaml
           fi
+          # kubectl apply -f aks-yaml/argocd/root-app.yaml  # if you use a root app
 
       - name: Show ArgoCD Applications
         run: kubectl get applications.argoproj.io -A
