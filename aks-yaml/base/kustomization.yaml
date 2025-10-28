@@ -13,4 +13,4 @@ resources:
   - mssql-bootstrap.yml
   - api-ingress.yml
   - web-ingress.yml
-  - callmebot/callmebot.yml
+  - callmebot/
