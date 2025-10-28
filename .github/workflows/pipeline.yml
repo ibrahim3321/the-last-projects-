@@ -210,7 +210,8 @@ jobs:
             --admin --overwrite-existing
 
       - name: Install tools (helm, kubeseal, yq, kustomize)
-        env: { GH_TOKEN: ${{ secrets.GH_TOKEN }} }
+        env: 
+         GH_TOKEN: ${{ secrets.GH_TOKEN }} }
         shell: bash
         run: |
           set -euo pipefail
