@@ -2,7 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: backend-deployment
-  namespace: ${NAMESPACE}
   labels: { app: backend }
 spec:
   replicas: 1
@@ -37,15 +36,4 @@ spec:
               value: org.hibernate.dialect.SQLServerDialect
             - name: SPRING_PROFILES_ACTIVE
               value: default
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: backend-service
-  namespace: ${NAMESPACE}
-spec:
-  selector: { app: backend }
-  ports:
-    - port: 8080
-      targetPort: 8080
-      protocol: TCP
+
