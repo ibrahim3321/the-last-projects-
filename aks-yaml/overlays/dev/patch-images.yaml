@@ -1,5 +1,5 @@
-# NOTE: __ACR_FQDN__ is replaced by the Deploy workflow.
-# Default to "latest-dev"; workflow can pin to "${SHA}-dev".
+# NOTE:  is replaced by the Deploy workflow.
+# Default to "7dd8dfed4b0e6ce3f60d8cd7fe1496b397e6bf15-dev"; workflow can pin to "${SHA}-dev".
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,7 +9,7 @@ spec:
     spec:
       containers:
         - name: backend
-          image: __ACR_FQDN__/backend:latest-dev
+          image: /backend:7dd8dfed4b0e6ce3f60d8cd7fe1496b397e6bf15-dev
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: __ACR_FQDN__/frontend:latest-dev
+          image: /frontend:7dd8dfed4b0e6ce3f60d8cd7fe1496b397e6bf15-dev
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -31,4 +31,4 @@ spec:
     spec:
       containers:
         - name: adapter
-          image: __ACR_FQDN__/callmebot-adapter:latest-dev
+          image: /callmebot-adapter:7dd8dfed4b0e6ce3f60d8cd7fe1496b397e6bf15-dev
