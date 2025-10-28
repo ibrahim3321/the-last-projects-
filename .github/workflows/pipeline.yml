@@ -20,9 +20,18 @@ on:
         type: choice
         options: ["yes", "no"]
         default: "yes"
+      manage_secrets:
+        description: "Generate & commit sealed-secrets from GitHub Secrets if needed"
+        type: choice
+        options: ["auto", "yes", "no"]
+        default: "auto"
 
 env:
   REGISTRY_FQDN_SUFFIX: azurecr.io
+
+concurrency:
+  group: ci-infra-deploy-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   select-env:
@@ -106,6 +115,7 @@ jobs:
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/frontend:buildcache,mode=max
 
       - name: Build & push callmebot-adapter
+        if: ${{ hashFiles('aks-yaml/callmebot/**') != '' }}
         uses: docker/build-push-action@v5
         with:
           context: ./aks-yaml/callmebot
@@ -226,9 +236,9 @@ jobs:
             -n "${{ needs.infra.outputs.AKS_NAME }}" \
             --admin --overwrite-existing
 
-      - name: Install tools (helm, kubeseal, yq, kustomize) — resilient
+      - name: Install tools (helm, kubeseal, yq, kustomize)
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}   # optional to reduce API rate limits
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -237,7 +247,6 @@ jobs:
 
           ARCH="$(uname -m)"; case "$ARCH" in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) echo "Unsupported arch: $(uname -m)"; exit 1;; esac
 
-          # kubeseal via API (fallback to fixed version)
           API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest"
           AUTH_H=""
           [[ -n "${GH_TOKEN:-}" ]] && AUTH_H="-H Authorization: Bearer $GH_TOKEN"
@@ -254,23 +263,30 @@ jobs:
               sudo install -m 0755 "$FILE" /usr/local/bin/kubeseal
             fi
           else
-            echo "Falling back to kubeseal v0.26.1"
             curl -fsSL -o kubeseal.tgz "https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.26.1/kubeseal-0.26.1-linux-${ARCH}.tar.gz"
             tar -xzf kubeseal.tgz
             sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
           fi
-          kubeseal --version
 
           sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_${ARCH}"
           sudo chmod +x /usr/local/bin/yq
-          yq --version
 
           KUSTOMIZE_VERSION="5.4.2"
           curl -fsSL -o kustomize.tar.gz \
             "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz"
           tar -xzf kustomize.tar.gz
           sudo install -m 0755 kustomize /usr/local/bin/kustomize
-          kustomize version
+
+      - name: Sanity check Kustomize (fail fast)
+        shell: bash
+        env:
+          ENV: ${{ needs.build.outputs.ENV }}
+        run: |
+          set -euo pipefail
+          echo "==> kustomize build aks-yaml/secrets/${ENV}"
+          kustomize build "aks-yaml/secrets/${ENV}" >/dev/null
+          echo "==> kustomize build aks-yaml/overlays/${ENV}"
+          kustomize build "aks-yaml/overlays/${ENV}" >/dev/null
 
       - name: Install Sealed-Secrets controller (Helm)
         shell: bash
@@ -280,22 +296,41 @@ jobs:
           helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
             --namespace kube-system --create-namespace --wait --timeout 10m
 
+      - name: Ensure target namespaces exist (defensive)
+        shell: bash
+        run: |
+          kubectl get ns dev        >/dev/null 2>&1 || kubectl create ns dev
+          kubectl get ns monitoring >/dev/null 2>&1 || kubectl create ns monitoring
+          kubectl get ns argocd     >/dev/null 2>&1 || kubectl create ns argocd
+
       - name: Fetch Sealed-Secrets public cert
         shell: bash
         run: |
           set -euo pipefail
           kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
 
-      - name: Build & seal Secrets from JSON GitHub Secrets
+      - name: Build & seal Secrets from GitHub Secrets (auto/optional)
+        if: ${{ github.event.inputs.manage_secrets != 'no' }}
         shell: bash
         env:
-          ENV:           ${{ needs.build.outputs.ENV }}
-          SLACK_RAW:     ${{ secrets.SLACK_WEBHOOK_SECRETS }}
-          CALLMEBOT_RAW: ${{ secrets.CALLMEBOT_SECRETS }}
-          MSSQL_RAW:     ${{ secrets.MSSQL_SECRETS }}
-          GRAFANA_RAW:   ${{ secrets.GRAFANA_CREDENTILALS }}
+          ENV:              ${{ needs.build.outputs.ENV }}
+          SLACK_RAW:        ${{ secrets.SLACK_WEBHOOK_SECRETS }}
+          CALLMEBOT_RAW:    ${{ secrets.CALLMEBOT_SECRETS }}
+          MSSQL_RAW:        ${{ secrets.MSSQL_SECRETS }}
+          GRAFANA_RAW:      ${{ secrets.GRAFANA_CREDENTIALS }}
+          GRAFANA_RAW_FALL: ${{ secrets.GRAFANA_CREDENTILALS }}   # fallback if old typo secret still used
+          MODE:             ${{ github.event.inputs.manage_secrets }}
         run: |
           set -euo pipefail
+
+          # Skip if files already exist and mode is auto
+          if [[ "${MODE:-auto}" == "auto" ]] && ls "aks-yaml/secrets/${ENV}/"*sealed.yaml >/dev/null 2>&1; then
+            echo "Sealed-secret files already present; skipping (auto mode)."
+            exit 0
+          fi
+
+          # Prefer corrected GRAFANA_CREDENTIALS; fall back to old one if empty
+          if [[ -z "${GRAFANA_RAW}" && -n "${GRAFANA_RAW_FALL}" ]]; then GRAFANA_RAW="${GRAFANA_RAW_FALL}"; fi
 
           norm() { tr -d '\r' <<<"$1"; }
 
@@ -306,7 +341,6 @@ jobs:
             OUT="/tmp/${NAME}.yaml"
 
             if grep -qE '^apiVersion:\s*v1' <<<"$RAW" && grep -qE '^kind:\s*Secret' <<<"$RAW"; then
-              # force namespace if absent
               awk -v ns="$NS" '
                 /^metadata:/ {print; m=1; next}
                 m && $0 ~ /^  namespace:/ {n=1}
@@ -408,10 +442,13 @@ jobs:
           set -euo pipefail
           apply_if_exists () { [[ -f "$1" ]] && kubectl apply -f "$1" || echo "skip $1"; }
 
+          # These must point to:
+          #   app-secrets-<env>.yaml: spec.source.path: aks-yaml/secrets/<env>
+          #   app-<env>.yaml:        spec.source.path: aks-yaml/overlays/<env>
           apply_if_exists "aks-yaml/argocd/app-secrets-${ENV}.yaml"
           apply_if_exists "aks-yaml/argocd/app-${ENV}.yaml"
 
-          # Optional monitoring via Argo (keep only if you DID NOT move to Ansible)
+          # Optional monitoring apps if present
           apply_if_exists "aks-yaml/argocd-app-kube-prometheus-stack.yml"
           apply_if_exists "aks-yaml/argocd-app-grafana.yml"
 

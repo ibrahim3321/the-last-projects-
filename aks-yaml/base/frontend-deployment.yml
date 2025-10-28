@@ -13,6 +13,6 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: ${ACR_LOGIN_SERVER}/frontend:${FRONTEND_TAG}
+          image: __ACR_FQDN__/frontend:latest
           imagePullPolicy: IfNotPresent
           ports: [{ containerPort: 80 }]

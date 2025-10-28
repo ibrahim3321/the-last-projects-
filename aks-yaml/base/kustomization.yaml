@@ -1,18 +1,24 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-
-
 resources:
-  - backend-config.yml
+  # app
   - backend-deployment.yml
   - backend-svc.yml
-  - frontend-config.yml
+  - backend-config.yml
   - frontend-deployment.yml
   - frontend-svc.yml
+  - frontend-config.yml
+
+  # database
   - mssql-deployment.yml
-  - mssql-pvc.yml
   - mssql-svc.yml
+  - mssql-pvc.yml
   - mssql-bootstrap.yml
+
+  # ingress
   - web-ingress.yml
   - api-ingress.yml
+
+  # callmebot adapter (now included)
+  - ../callmebot/callmebot.yml

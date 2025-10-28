@@ -12,7 +12,7 @@ spec:
     spec:
       containers:
         - name: backend
-          image: ${ACR_LOGIN_SERVER}/backend:${BACKEND_TAG}
+          image: __ACR_FQDN__/backend:latest-dev
           imagePullPolicy: IfNotPresent
           ports: [{ containerPort: 8080 }]
           env:

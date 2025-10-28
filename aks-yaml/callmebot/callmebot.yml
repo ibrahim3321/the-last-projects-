@@ -2,43 +2,34 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: callmebot-adapter
-  namespace: monitoring
+  labels: { app: callmebot-adapter }
 spec:
   replicas: 1
   selector: { matchLabels: { app: callmebot-adapter } }
   template:
-    metadata: { labels: { app: callmebot-adapter } }
+    metadata:
+      labels: { app: callmebot-adapter }
     spec:
       containers:
-        - name: adapter
-          image: ${ACR_LOGIN_SERVER}/backend:${BACKEND_TAG}   # <-- if you used a different tag, update it
-          imagePullPolicy: IfNotPresent
+        - name: callmebot-adapter
+          image: __ACR_FQDN__/callmebot-adapter:latest
+          ports: [ { containerPort: 8080 } ]
           env:
-            - name: CALLMEBOT_BASE_URL
-              valueFrom: { secretKeyRef: { name: callmebot-config, key: base_url }}
-            - name: CALLMEBOT_PHONE
-              valueFrom: { secretKeyRef: { name: callmebot-config, key: phone }}
-            - name: CALLMEBOT_APIKEY
-              valueFrom: { secretKeyRef: { name: callmebot-config, key: apikey }}
-          ports:
-            - containerPort: 8080
-          readinessProbe:
-            httpGet: { path: /healthz, port: 8080 }
-            initialDelaySeconds: 3
-          livenessProbe:
-            httpGet: { path: /healthz, port: 8080 }
-            initialDelaySeconds: 10
+            - name: phone
+              valueFrom: { secretKeyRef: { name: callmebot-config, key: phone } }
+            - name: apikey
+              valueFrom: { secretKeyRef: { name: callmebot-config, key: apikey } }
+            - name: base_url
+              valueFrom: { secretKeyRef: { name: callmebot-config, key: base_url } }
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: callmebot-adapter
-  namespace: monitoring
 spec:
   selector: { app: callmebot-adapter }
   ports:
     - name: http
       port: 8080
       targetPort: 8080
-      protocol: TCP
   type: ClusterIP
