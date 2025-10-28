@@ -80,6 +80,7 @@ jobs:
         run: |
           echo "IMAGE_TAG_SUFFIX=${GITHUB_SHA}-${{ needs.select-env.outputs.ENV }}" >> $GITHUB_OUTPUT
 
+      # Backend
       - name: Build & push backend
         uses: docker/build-push-action@v5
         with:
@@ -91,6 +92,7 @@ jobs:
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/backend:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/backend:buildcache,mode=max
 
+      # Frontend
       - name: Build & push frontend
         uses: docker/build-push-action@v5
         with:
@@ -102,6 +104,7 @@ jobs:
           cache-from: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/frontend:buildcache
           cache-to: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/frontend:buildcache,mode=max
 
+      # Callmebot adapter
       - name: Build & push callmebot-adapter
         uses: docker/build-push-action@v5
         with:
@@ -133,7 +136,7 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Export ARM env for Service Principal
+      - name: Export ARM env for Service Principal (for Terraform)
         run: |
           set -euo pipefail
           sudo apt-get update -y && sudo apt-get install -y jq
@@ -191,18 +194,66 @@ jobs:
           echo "RG=$RG" >> $GITHUB_OUTPUT
           echo "AKS=${PREFIX}-aks" >> $GITHUB_OUTPUT
 
-      - name: (Optional) Enable AGIC
+      - name: (Fix) Grant AGIC identity permissions (precreated or auto-discover)
         if: ${{ github.event.inputs.enable_agic == 'yes' || github.event_name != 'workflow_dispatch' }}
+        env:
+          AKS_RG:  ${{ steps.aksnames.outputs.RG }}
+          AKS_NAME: ${{ steps.aksnames.outputs.AKS }}
+          # Optional secrets (preferred): resource IDs
+          AGIC_UAMI_ID: ${{ secrets.AGIC_UAMI_ID }}
+          APPGW_ID:     ${{ secrets.APPGW_ID }}
         run: |
           set -euo pipefail
-          AKS_NAME="${{ steps.aksnames.outputs.AKS }}"
-          RESOURCE_GROUP="${{ steps.aksnames.outputs.RG }}"
-          az aks enable-addons \
-            -a ingress-appgw \
-            -n "$AKS_NAME" \
-            -g "$RESOURCE_GROUP" \
-            --appgw-name "${AKS_NAME}-appgw" \
-            --appgw-subnet-cidr "10.225.0.0/16"
+          # AKS MSI
+          AKS_MSI=$(az aks show -g "$AKS_RG" -n "$AKS_NAME" --query identity.principalId -o tsv)
+          MC_RG=$(az aks show -g "$AKS_RG" -n "$AKS_NAME" --query nodeResourceGroup -o tsv)
+
+          UAMI_ID="${AGIC_UAMI_ID:-}"
+          APPGW="${APPGW_ID:-}"
+
+          # Auto-discover in MC_* if not provided
+          if [ -z "$UAMI_ID" ]; then
+            UAMI_ID=$(az resource list -g "$MC_RG" --resource-type Microsoft.ManagedIdentity/userAssignedIdentities \
+              --query "[?contains(name, 'ingress') || contains(name,'appgw') || contains(name,'applicationgateway')].id | [0]" -o tsv)
+          fi
+          if [ -z "$APPGW" ]; then
+            APPGW=$(az network application-gateway list -g "$MC_RG" --query "[0].id" -o tsv)
+          fi
+
+          if [ -z "$UAMI_ID" ] || [ -z "$APPGW" ]; then
+            echo "AGIC UAMI or AppGW not found. Provide secrets AGIC_UAMI_ID and APPGW_ID or create them first."; exit 1
+          fi
+
+          UAMI_PRINCIPAL=$(az resource show --ids "$UAMI_ID" --query properties.principalId -o tsv)
+
+          # Grant required roles (idempotent)
+          az role assignment create --assignee "$AKS_MSI"       --role "Managed Identity Operator" --scope "$UAMI_ID" || true
+          az role assignment create --assignee "$UAMI_PRINCIPAL" --role "Contributor"              --scope "$APPGW"  || true
+
+          echo "UAMI_ID=$UAMI_ID" >> $GITHUB_ENV
+          echo "APPGW_ID=$APPGW"  >> $GITHUB_ENV
+
+      - name: (Optional) Enable AGIC
+        if: ${{ github.event.inputs.enable_agic == 'yes' || github.event_name != 'workflow_dispatch' }}
+        env:
+          AKS_RG:  ${{ steps.aksnames.outputs.RG }}
+          AKS_NAME: ${{ steps.aksnames.outputs.AKS }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APPGW_ID:-}" ] && [ -n "${UAMI_ID:-}" ]; then
+            az aks enable-addons \
+              -a ingress-appgw \
+              -g "$AKS_RG" -n "$AKS_NAME" \
+              --appgw-id "${APPGW_ID}" \
+              --identity-resource-id "${UAMI_ID}"
+          else
+            # Backward-compatible path (let AKS create resources in MC_* RG)
+            az aks enable-addons \
+              -a ingress-appgw \
+              -g "$AKS_RG" -n "$AKS_NAME" \
+              --appgw-name "${AKS_NAME}-appgw" \
+              --appgw-subnet-cidr "10.225.0.0/16"
+          fi
 
   deploy:
     needs: [infra, build]
@@ -228,45 +279,28 @@ jobs:
             -n "${{ needs.infra.outputs.AKS_NAME }}" \
             --admin --overwrite-existing
 
-      - name: Install tools (helm, kubeseal, yq, kustomize)
+      - name: Install tools (helm, kubeseal, yq, kustomize) — resilient
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}   # optional to avoid GitHub API rate limits
         run: |
           set -euo pipefail
-
           # Helm
           sudo snap install helm --classic
 
-          # Detect arch
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64) ARCH="amd64" ;;
-            aarch64|arm64) ARCH="arm64" ;;
-            *) echo "Unsupported arch: $ARCH"; exit 1 ;;
-          esac
+          # Arch
+          ARCH="$(uname -m)"; case "$ARCH" in x86_64) ARCH="amd64";; aarch64|arm64) ARCH="arm64";; *) echo "Unsupported arch: $ARCH"; exit 1;; esac
 
-          # ---- kubeseal (resolve asset from GitHub Releases) ----
-          KUBSEAL_VERSION="${KUBSEAL_VERSION:-}"
-          if [ -n "$GH_TOKEN" ]; then AUTH_H="-H Authorization: Bearer $GH_TOKEN"; else AUTH_H=""; fi
-
-          if [ -z "${KUBSEAL_VERSION}" ]; then
-            API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest"
+          # kubeseal — resolve exact asset from Releases API, fallback to known-good tag
+          if [ -n "${GH_TOKEN:-}" ]; then AUTH_H="-H Authorization: Bearer $GH_TOKEN"; else AUTH_H=""; fi
+          KUBSEAL_VERSION="${KUBSEAL_VERSION:-}"   # leave empty to use 'latest'
+          if [ -z "$KUBSEAL_VERSION" ]; then API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest"; else API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/tags/v${KUBSEAL_VERSION}"; fi
+          DL_URL="$(curl -fsSL $AUTH_H "$API_URL" | jq -r ".assets[]?.browser_download_url | select(test(\"kubeseal-.*-linux-${ARCH}$\"))" | head -n1 || true)"
+          if [ -n "$DL_URL" ]; then
+            curl -fsSL -o kubeseal "$DL_URL"
           else
-            API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/tags/v${KUBSEAL_VERSION}"
+            echo "API asset resolve failed; using fallback v0.26.1"
+            curl -fsSL -o kubeseal "https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.26.1/kubeseal-0.26.1-linux-${ARCH}"
           fi
-
-          echo "Resolving kubeseal asset from: $API_URL"
-          DL_URL="$(curl -fsSL $AUTH_H "$API_URL" \
-            | jq -r ".assets[]?.browser_download_url | select(test(\"kubeseal-.*-linux-${ARCH}$\"))" \
-            | head -n1)"
-
-          if [ -z "${DL_URL}" ] || ! curl -fsSL -o kubeseal "${DL_URL}"; then
-            echo "Could not resolve kubeseal asset via API; trying a known-good fallback …"
-            FALLBACK_TAG="0.26.1"
-            FALLBACK_URL="https://github.com/bitnami-labs/sealed-secrets/releases/download/v${FALLBACK_TAG}/kubeseal-${FALLBACK_TAG}-linux-${ARCH}"
-            curl -fsSL -o kubeseal "${FALLBACK_URL}"
-          fi
-
           sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
           /usr/local/bin/kubeseal --version
 
@@ -281,3 +315,79 @@ jobs:
           tar -xzf kustomize.tar.gz
           sudo install -m 0755 kustomize /usr/local/bin/kustomize
           kustomize version
+
+      - name: Install Sealed-Secrets controller
+        run: |
+          set -euo pipefail
+          helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
+          helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
+            --namespace kube-system --create-namespace --wait --timeout 10m
+
+      - name: Fetch Sealed-Secrets cert
+        run: |
+          set -euo pipefail
+          kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
+
+      - name: Prepare env folder
+        run: |
+          set -euo pipefail
+          mkdir -p "aks-yaml/secrets/${{ needs.build.outputs.ENV }}"
+
+      - name: Write plain Secret yamls (from repo secrets)
+        run: |
+          set -euo pipefail
+          printf "%s\n" '${{ secrets.SLACK_WEBHOOK_SECRETS }}' > /tmp/slack.yaml
+          printf "%s\n" '${{ secrets.CALLMEBOT_SECRETS }}'     > /tmp/callmebot.yaml
+          printf "%s\n" '${{ secrets.MSSQL_SECRETS }}'         > /tmp/mssql.yaml
+          printf "%s\n" '${{ secrets.GRAFANA_CREDENTILALS }}'  > /tmp/grafana.yaml
+
+      - name: Seal secrets → commit
+        run: |
+          set -euo pipefail
+          ENV="${{ needs.build.outputs.ENV }}"
+          for s in slack callmebot mssql grafana; do
+            kubeseal --format yaml --cert pubcert.pem < "/tmp/${s}.yaml" > "aks-yaml/secrets/${ENV}/${s}-sealed.yaml"
+          done
+          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name "github-actions"
+          git add "aks-yaml/secrets/${ENV}" || true
+          git commit -m "ci: sealed-secrets (${ENV}) [skip ci]" || echo "No changes"
+          git push || true
+
+      - name: Patch image registry & tag in overlay
+        run: |
+          set -euo pipefail
+          ENV="${{ needs.build.outputs.ENV }}"
+          ACR_FQDN="${{ needs.build.outputs.ACR_FQDN }}"
+          PATCH="aks-yaml/overlays/${ENV}/patch-images.yaml"
+          sed -i "s#__ACR_FQDN__#${ACR_FQDN}#g" "$PATCH"
+          if [ "${{ github.event.inputs.pin_sha || 'yes' }}" = "yes" ]; then
+            sed -i "s#latest-${ENV}#${{ needs.build.outputs.IMAGE_TAG_SUFFIX }}#g" "$PATCH"
+          fi
+          git add "$PATCH" || true
+          git commit -m "ci: image pin for ${ENV} [skip ci]" || echo "No changes"
+          git push || true
+
+      - name: Install Argo CD (Helm)
+        run: |
+          set -euo pipefail
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm upgrade -i argocd argo/argo-cd \
+            --namespace argocd --create-namespace \
+            --values aks-yaml/ansible-monitoring-aks/values-argocd.yaml \
+            --wait --timeout 10m
+
+      - name: Bootstrap Argo applications
+        run: |
+          set -euo pipefail
+          ENV="${{ needs.build.outputs.ENV }}"
+          if [ "$ENV" = "prod" ]; then
+            kubectl apply -f aks-yaml/argocd/app-secrets-prod.yaml
+            kubectl apply -f aks-yaml/argocd/app-prod.yaml
+          else
+            kubectl apply -f aks-yaml/argocd/app-secrets-dev.yaml
+            kubectl apply -f aks-yaml/argocd/app-dev.yaml
+          fi
+
+      - name: Show ArgoCD Applications
+        run: kubectl get applications.argoproj.io -A
