@@ -1,4 +1,4 @@
-name: CI → Infra → Deploy (branch-friendly-1)
+name: CI → Infra → Deploy (branch-friendly)
 
 on:
   push:
@@ -229,10 +229,15 @@ jobs:
             --admin --overwrite-existing
 
       - name: Install tools (helm, kubeseal, yq, kustomize)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
+
+          # Helm
           sudo snap install helm --classic
 
+          # Detect arch
           ARCH="$(uname -m)"
           case "$ARCH" in
             x86_64) ARCH="amd64" ;;
@@ -240,84 +245,39 @@ jobs:
             *) echo "Unsupported arch: $ARCH"; exit 1 ;;
           esac
 
-          KUBSEAL_VERSION="0.27.2"
-          ASSET="kubeseal-${KUBSEAL_VERSION}-linux-${ARCH}"
-          URL="https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBSEAL_VERSION}/${ASSET}"
-          echo "Downloading kubeseal ${KUBSEAL_VERSION} (${ARCH})"
-          curl -fsSL -o kubeseal "${URL}"
-          sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
+          # ---- kubeseal (resolve asset from GitHub Releases) ----
+          KUBSEAL_VERSION="${KUBSEAL_VERSION:-}"
+          if [ -n "$GH_TOKEN" ]; then AUTH_H="-H Authorization: Bearer $GH_TOKEN"; else AUTH_H=""; fi
 
+          if [ -z "${KUBSEAL_VERSION}" ]; then
+            API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest"
+          else
+            API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/tags/v${KUBSEAL_VERSION}"
+          fi
+
+          echo "Resolving kubeseal asset from: $API_URL"
+          DL_URL="$(curl -fsSL $AUTH_H "$API_URL" \
+            | jq -r ".assets[]?.browser_download_url | select(test(\"kubeseal-.*-linux-${ARCH}$\"))" \
+            | head -n1)"
+
+          if [ -z "${DL_URL}" ] || ! curl -fsSL -o kubeseal "${DL_URL}"; then
+            echo "Could not resolve kubeseal asset via API; trying a known-good fallback …"
+            FALLBACK_TAG="0.26.1"
+            FALLBACK_URL="https://github.com/bitnami-labs/sealed-secrets/releases/download/v${FALLBACK_TAG}/kubeseal-${FALLBACK_TAG}-linux-${ARCH}"
+            curl -fsSL -o kubeseal "${FALLBACK_URL}"
+          fi
+
+          sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
+          /usr/local/bin/kubeseal --version
+
+          # yq
           sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_${ARCH}"
           sudo chmod +x /usr/local/bin/yq
+          yq --version
 
+          # kustomize
           KUSTOMIZE_VERSION="5.4.2"
           curl -fsSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz"
           tar -xzf kustomize.tar.gz
           sudo install -m 0755 kustomize /usr/local/bin/kustomize
-
-      - name: Install Sealed-Secrets controller
-        run: |
-          helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
-          helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
-            --namespace kube-system --create-namespace --wait --timeout 10m
-
-      - name: Fetch Sealed-Secrets cert
-        run: |
-          kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
-
-      - name: Prepare env folder
-        run: mkdir -p "aks-yaml/secrets/${{ needs.build.outputs.ENV }}"
-
-      - name: Write plain Secret yamls (from repo secrets)
-        run: |
-          printf "%s\n" '${{ secrets.SLACK_WEBHOOK_SECRETS }}' > /tmp/slack.yaml
-          printf "%s\n" '${{ secrets.CALLMEBOT_SECRETS }}'     > /tmp/callmebot.yaml
-          printf "%s\n" '${{ secrets.MSSQL_SECRETS }}'         > /tmp/mssql.yaml
-          printf "%s\n" '${{ secrets.GRAFANA_CREDENTILALS }}'  > /tmp/grafana.yaml
-
-      - name: Seal secrets → commit
-        run: |
-          ENV="${{ needs.build.outputs.ENV }}"
-          for s in slack callmebot mssql grafana; do
-            kubeseal --format yaml --cert pubcert.pem < "/tmp/${s}.yaml" > "aks-yaml/secrets/${ENV}/${s}-sealed.yaml"
-          done
-          git config user.email "github-actions@users.noreply.github.com"
-          git config user.name "github-actions"
-          git add "aks-yaml/secrets/${ENV}" || true
-          git commit -m "ci: sealed-secrets (${ENV}) [skip ci]" || echo "No changes"
-          git push || true
-
-      - name: Patch image registry & tag in overlay
-        run: |
-          ENV="${{ needs.build.outputs.ENV }}"
-          ACR_FQDN="${{ needs.build.outputs.ACR_FQDN }}"
-          PATCH="aks-yaml/overlays/${ENV}/patch-images.yaml"
-          sed -i "s#__ACR_FQDN__#${ACR_FQDN}#g" "$PATCH"
-          if [ "${{ github.event.inputs.pin_sha || 'yes' }}" = "yes" ]; then
-            sed -i "s#latest-${ENV}#${{ needs.build.outputs.IMAGE_TAG_SUFFIX }}#g" "$PATCH"
-          fi
-          git add "$PATCH" || true
-          git commit -m "ci: image pin for ${ENV} [skip ci]" || echo "No changes"
-          git push || true
-
-      - name: Install Argo CD (Helm)
-        run: |
-          helm repo add argo https://argoproj.github.io/argo-helm
-          helm upgrade -i argocd argo/argo-cd \
-            --namespace argocd --create-namespace \
-            --values aks-yaml/ansible-monitoring-aks/values-argocd.yaml \
-            --wait --timeout 10m
-
-      - name: Bootstrap Argo applications
-        run: |
-          ENV="${{ needs.build.outputs.ENV }}"
-          if [ "$ENV" = "prod" ]; then
-            kubectl apply -f aks-yaml/argocd/app-secrets-prod.yaml
-            kubectl apply -f aks-yaml/argocd/app-prod.yaml
-          else
-            kubectl apply -f aks-yaml/argocd/app-secrets-dev.yaml
-            kubectl apply -f aks-yaml/argocd/app-dev.yaml
-          fi
-
-      - name: Show ArgoCD Applications
-        run: kubectl get applications.argoproj.io -A
+          kustomize version
