@@ -9,7 +9,6 @@ on:
         description: "dev or prod (override branch mapping)"
         type: choice
         options: [dev, prod]
-        required: false
       enable_agic:
         description: "Enable AGIC via az aks enable-addons"
         type: choice
@@ -96,10 +95,27 @@ jobs:
           cache-from: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:buildcache
           cache-to: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:buildcache,mode=max
 
+      # Find the correct callmebot Docker context
+      - name: Find callmebot build context
+        id: cbpath
+        shell: bash
+        run: |
+          set -euo pipefail
+          for p in ./aks-yaml/base/callmebot ./aks-yaml/callmebot ; do
+            if [ -d "$p" ]; then
+              echo "path=$p" >> "$GITHUB_OUTPUT"
+              echo "Docker context: $p"
+              exit 0
+            fi
+          done
+          echo "::error::callmebot context not found (expected ./aks-yaml/base/callmebot or ./aks-yaml/callmebot)"
+          exit 1
+
       - name: Build & push callmebot-adapter
         uses: docker/build-push-action@v5
         with:
-          context: ./aks-yaml/callmebot
+          context: ${{ steps.cbpath.outputs.path }}
+          file: ${{ steps.cbpath.outputs.path }}/Dockerfile
           push: true
           tags: |
             ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/callmebot-adapter:latest-${{ needs.select-env.outputs.ENV }}
@@ -146,10 +162,6 @@ jobs:
           ACR_ID=$(az acr show -n "${{ secrets.ACR_NAME }}" --query id -o tsv)
           echo "ACR_ID=$ACR_ID" >> "$GITHUB_OUTPUT"
 
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.9.5
-
       - name: Write env.auto.tfvars.json from JSON secret
         working-directory: ./terraform
         shell: bash
@@ -159,6 +171,10 @@ jobs:
           if [[ "$ENV" == "prod" ]]; then RAW='${{ secrets.PROD }}'; else RAW='${{ secrets.DEV }}'; fi
           echo "$RAW" | jq --arg acr_id "${{ steps.acr.outputs.ACR_ID }}" '. + {acr_id:$acr_id}' > env.auto.tfvars.json
           jq -r 'keys[]' env.auto.tfvars.json | sed 's/^/tfvar: /'
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
 
       - name: Terraform Init/Plan/Apply
         working-directory: ./terraform
@@ -243,10 +259,6 @@ jobs:
           curl -fsSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz"
           tar -xzf kustomize.tar.gz && sudo install -m 0755 kustomize /usr/local/bin/kustomize
 
-      - name: Compute ACR_FQDN for this job
-        shell: bash
-        run: echo "ACR_FQDN=${{ secrets.ACR_NAME }}.${REGISTRY_FQDN_SUFFIX}" >> $GITHUB_ENV
-
       - name: Sanity check Kustomize (fail fast)
         shell: bash
         run: |
@@ -262,17 +274,6 @@ jobs:
           helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
             --namespace kube-system --create-namespace --wait --timeout 10m
 
-      - name: Ensure target namespaces exist (defensive)
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl get ns dev        >/dev/null 2>&1 || kubectl create ns dev
-          kubectl get ns monitoring >/dev/null 2>&1 || kubectl create ns monitoring
-
-      - name: Fetch Sealed-Secrets public cert
-        shell: bash
-        run: kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
-
       - name: Patch overlays with ACR + image tag
         shell: bash
         env:
@@ -282,6 +283,7 @@ jobs:
           set -euo pipefail
           PATCH="aks-yaml/overlays/${ENV}/patch-images.yaml"
           [[ -f "$PATCH" ]] || { echo "No $PATCH to patch; skipping"; exit 0; }
+          ACR_FQDN="${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}"
           sed -i "s#__ACR_FQDN__#${ACR_FQDN}#g" "$PATCH"
           if [[ "${PIN_SHA_INPUT:-yes}" == "yes" ]]; then
             sed -i "s#latest-${ENV}#${IMAGE_TAG}#g" "$PATCH"
@@ -306,6 +308,8 @@ jobs:
 
       - name: Bootstrap Argo applications
         shell: bash
+        env:
+          ENV: ${{ needs.build.outputs.ENV }}
         run: |
           set -euo pipefail
           apply_if_exists () { [[ -f "$1" ]] && kubectl apply -f "$1" || echo "skip $1"; }
