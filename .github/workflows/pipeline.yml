@@ -203,20 +203,19 @@ jobs:
             echo "AGIC already enabled — nothing to do."
             exit 0
           fi
-          if ! az aks enable-addons \
-              -a ingress-appgw \
-              -g "$AKS_RG" -n "$AKS_NAME" \
-              --appgw-name "${AKS_NAME}-appgw" \
-              --appgw-subnet-cidr "10.225.0.0/16"; then
-            echo "First attempt failed. Trying self-heal (disable → enable)…"
-            az aks disable-addons -a ingress-appgw -g "$AKS_RG" -n "$AKS_NAME" || true
-            az aks enable-addons \
-              -a ingress-appgw \
-              -g "$AKS_RG" -n "$AKS_NAME" \
-              --appgw-name "${AKS_NAME}-appgw" \
-              --appgw-subnet-cidr "10.225.0.0/16"
-          fi
-          echo "AGIC enabled with auto-created resources."
+          az aks enable-addons \
+            -a ingress-appgw \
+            -g "$AKS_RG" -n "$AKS_NAME" \
+            --appgw-name "${AKS_NAME}-appgw" \
+            --appgw-subnet-cidr "10.225.0.0/16" || {
+              echo "Retrying enable-addons…"
+              az aks disable-addons -a ingress-appgw -g "$AKS_RG" -n "$AKS_NAME" || true
+              az aks enable-addons \
+                -a ingress-appgw \
+                -g "$AKS_RG" -n "$AKS_NAME" \
+                --appgw-name "${AKS_NAME}-appgw" \
+                --appgw-subnet-cidr "10.225.0.0/16"
+            }
 
   deploy:
     needs: [infra, build]
@@ -247,31 +246,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}   # optional: avoids GitHub API rate limits
         run: |
           set -euo pipefail
-
-          # Helm
           sudo snap install helm --classic
-
-          # jq (needed for GitHub API parsing)
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
-          # Arch map
+          sudo apt-get update -y && sudo apt-get install -y jq
           ARCH="$(uname -m)"; case "$ARCH" in
             x86_64) ARCH="amd64" ;;
             aarch64|arm64) ARCH="arm64" ;;
             *) echo "Unsupported arch: $(uname -m)"; exit 1 ;;
           esac
-
-          # ----- kubeseal (robust: API → asset auto-pick → tar or raw) -----
           if [ -n "${GH_TOKEN:-}" ]; then AUTH_H="-H Authorization: Bearer $GH_TOKEN"; else AUTH_H=""; fi
           API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest"
           DL_URL="$(curl -fsSL $AUTH_H -H 'Accept: application/vnd.github+json' "$API_URL" \
-            | jq -r ".assets[]?.browser_download_url
-                      | select(test(\"kubeseal-.*-linux-${ARCH}(\\\\.tar\\\\.gz)?$\"))" \
+            | jq -r ".assets[]?.browser_download_url | select(test(\"kubeseal-.*-linux-${ARCH}(\\\\.tar\\\\.gz)?$\"))" \
             | head -n1 || true)"
-
           if [ -n "$DL_URL" ]; then
-            echo "kubeseal download: $DL_URL"
             FNAME="${DL_URL##*/}"
             curl -fsSL -o "$FNAME" "$DL_URL"
             if [[ "$FNAME" == *.tar.gz ]]; then
@@ -283,24 +270,93 @@ jobs:
               sudo install -m 0755 "$FNAME" /usr/local/bin/kubeseal
             fi
           else
-            echo "Latest asset not found via API; using known-good fallback v0.26.1 (tarball)."
             FALLBACK="https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.26.1/kubeseal-0.26.1-linux-${ARCH}.tar.gz"
             curl -fsSL -o kubeseal.tgz "$FALLBACK"
             tar -xzf kubeseal.tgz
             sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
           fi
-
-          /usr/local/bin/kubeseal --version
-
-          # yq
+          kubeseal --version
           sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_${ARCH}"
           sudo chmod +x /usr/local/bin/yq
           yq --version
-
-          # kustomize
           KUSTOMIZE_VERSION="5.4.2"
-          curl -fsSL -o kustomize.tar.gz \
-            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz"
+          curl -fsSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz"
           tar -xzf kustomize.tar.gz
           sudo install -m 0755 kustomize /usr/local/bin/kustomize
           kustomize version
+
+      - name: Install Sealed-Secrets controller
+        run: |
+          set -euo pipefail
+          helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
+          helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
+            --namespace kube-system --create-namespace --wait --timeout 10m
+
+      - name: Fetch Sealed-Secrets cert
+        run: |
+          set -euo pipefail
+          kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
+
+      - name: Prepare env folder
+        run: |
+          set -euo pipefail
+          mkdir -p "aks-yaml/secrets/${{ needs.build.outputs.ENV }}"
+
+      - name: Write plain Secret yamls (from repo secrets)
+        run: |
+          set -euo pipefail
+          printf "%s\n" '${{ secrets.SLACK_WEBHOOK_SECRETS }}' > /tmp/slack.yaml
+          printf "%s\n" '${{ secrets.CALLMEBOT_SECRETS }}'     > /tmp/callmebot.yaml
+          printf "%s\n" '${{ secrets.MSSQL_SECRETS }}'         > /tmp/mssql.yaml
+          printf "%s\n" '${{ secrets.GRAFANA_CREDENTILALS }}'  > /tmp/grafana.yaml
+
+      - name: Seal secrets → commit
+        run: |
+          set -euo pipefail
+          ENV="${{ needs.build.outputs.ENV }}"
+          for s in slack callmebot mssql grafana; do
+            kubeseal --format yaml --cert pubcert.pem < "/tmp/${s}.yaml" > "aks-yaml/secrets/${ENV}/${s}-sealed.yaml"
+          done
+          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name "github-actions"
+          git add "aks-yaml/secrets/${ENV}" || true
+          git commit -m "ci: sealed-secrets (${ENV}) [skip ci]" || echo "No changes"
+          git push || true
+
+      - name: Patch image registry & tag in overlay
+        run: |
+          set -euo pipefail
+          ENV="${{ needs.build.outputs.ENV }}"
+          ACR_FQDN="${{ needs.build.outputs.ACR_FQDN }}"
+          PATCH="aks-yaml/overlays/${ENV}/patch-images.yaml"
+          sed -i "s#__ACR_FQDN__#${ACR_FQDN}#g" "$PATCH"
+          if [ "${{ github.event.inputs.pin_sha || 'yes' }}" = "yes" ]; then
+            sed -i "s#latest-${ENV}#${{ needs.build.outputs.IMAGE_TAG_SUFFIX }}#g" "$PATCH"
+          fi
+          git add "$PATCH" || true
+          git commit -m "ci: image pin for ${ENV} [skip ci]" || echo "No changes"
+          git push || true
+
+      - name: Install Argo CD (Helm)
+        run: |
+          set -euo pipefail
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm upgrade -i argocd argo/argo-cd \
+            --namespace argocd --create-namespace \
+            --values aks-yaml/ansible-monitoring-aks/values-argocd.yaml \
+            --wait --timeout 10m
+
+      - name: Bootstrap Argo applications
+        run: |
+          set -euo pipefail
+          ENV="${{ needs.build.outputs.ENV }}"
+          if [ "$ENV" = "prod" ]; then
+            kubectl apply -f aks-yaml/argocd/app-secrets-prod.yaml
+            kubectl apply -f aks-yaml/argocd/app-prod.yaml
+          else
+            kubectl apply -f aks-yaml/argocd/app-secrets-dev.yaml
+            kubectl apply -f aks-yaml/argocd/app-dev.yaml
+          fi
+
+      - name: Show ArgoCD Applications
+        run: kubectl get applications.argoproj.io -A
