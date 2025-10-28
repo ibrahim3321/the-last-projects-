@@ -43,7 +43,8 @@ jobs:
               *) ENV=dev ;;
             esac
           fi
-          echo "ENV=$ENV" | tee -a "$GITHUB_OUTPUT"
+          echo "ENV=$ENV" >> "$GITHUB_OUTPUT"
+          echo "Selected ENV=$ENV"
 
   build:
     needs: [select-env]
@@ -70,7 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           ACR_NAME="${{ secrets.ACR_NAME }}"
-          echo "ACR_FQDN=${ACR_NAME}.${REGISTRY_FQDN_SUFFIX}" | tee -a "$GITHUB_OUTPUT"
+          echo "ACR_FQDN=${ACR_NAME}.${REGISTRY_FQDN_SUFFIX}" >> "$GITHUB_OUTPUT"
           az acr login --name "$ACR_NAME"
 
       - name: Set up Docker Buildx
@@ -80,7 +81,7 @@ jobs:
         id: meta
         shell: bash
         run: |
-          echo "IMAGE_TAG_SUFFIX=${GITHUB_SHA}-${{ needs.select-env.outputs.ENV }}" | tee -a "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG_SUFFIX=${GITHUB_SHA}-${{ needs.select-env.outputs.ENV }}" >> "$GITHUB_OUTPUT"
 
       - name: Build & push backend
         uses: docker/build-push-action@v5
@@ -135,15 +136,15 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Export ARM env for Service Principal (Terraform)
+      - name: Export ARM env for Terraform (SP + secret)
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y && sudo apt-get install -y jq
           CREDS='${{ secrets.AZURE_CREDENTIALS }}'
-          echo "ARM_CLIENT_ID=$(echo "$CREDS" | jq -r '.clientId // .appId')" >> $GITHUB_ENV
+          echo "ARM_CLIENT_ID=$(echo "$CREDS" | jq -r '.clientId // .appId')"           >> $GITHUB_ENV
           echo "ARM_CLIENT_SECRET=$(echo "$CREDS" | jq -r '.clientSecret // .password')" >> $GITHUB_ENV
-          echo "ARM_TENANT_ID=$(echo "$CREDS" | jq -r '.tenantId // .tenant')" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=$(echo "$CREDS" | jq -r '.tenantId // .tenant')"           >> $GITHUB_ENV
           echo "ARM_SUBSCRIPTION_ID=$(echo "$CREDS" | jq -r '.subscriptionId // .subscription')" >> $GITHUB_ENV
           echo "ARM_ENVIRONMENT=public" >> $GITHUB_ENV
 
@@ -153,7 +154,7 @@ jobs:
         run: |
           set -euo pipefail
           ACR_ID=$(az acr show -n "${{ secrets.ACR_NAME }}" --query id -o tsv)
-          echo "ACR_ID=$ACR_ID" | tee -a "$GITHUB_OUTPUT"
+          echo "ACR_ID=$ACR_ID" >> "$GITHUB_OUTPUT"
 
       - name: Write env.auto.tfvars.json from JSON secret
         working-directory: ./terraform
@@ -186,9 +187,9 @@ jobs:
         run: |
           set -euo pipefail
           RG=$(jq -r '.resource_group_name' env.auto.tfvars.json)
-          PREFIX=$(jq -r '.resource_prefix'      env.auto.tfvars.json)
-          echo "RG=$RG"   | tee -a "$GITHUB_OUTPUT"
-          echo "AKS=${PREFIX}-aks" | tee -a "$GITHUB_OUTPUT"
+          PREFIX=$(jq -r '.resource_prefix' env.auto.tfvars.json)
+          echo "RG=$RG"             >> "$GITHUB_OUTPUT"
+          echo "AKS=${PREFIX}-aks"  >> "$GITHUB_OUTPUT"
 
       - name: (Optional) Enable AGIC
         if: ${{ github.event.inputs.enable_agic == 'yes' || github.event_name != 'workflow_dispatch' }}
@@ -227,7 +228,7 @@ jobs:
 
       - name: Install tools (helm, kubeseal, yq, kustomize) — resilient
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}   # optional to avoid API rate limits
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}   # optional to reduce API rate limits
         shell: bash
         run: |
           set -euo pipefail
@@ -236,17 +237,15 @@ jobs:
 
           ARCH="$(uname -m)"; case "$ARCH" in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) echo "Unsupported arch: $(uname -m)"; exit 1;; esac
 
+          # kubeseal via API (fallback to fixed version)
           API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest"
           AUTH_H=""
-          if [[ -n "${GH_TOKEN:-}" ]]; then AUTH_H="-H Authorization: Bearer $GH_TOKEN"; fi
-
+          [[ -n "${GH_TOKEN:-}" ]] && AUTH_H="-H Authorization: Bearer $GH_TOKEN"
           DL_URL="$(curl -fsSL $AUTH_H -H 'Accept: application/vnd.github+json' "$API_URL" \
                      | jq -r ".assets[]?.browser_download_url
                               | select(test(\"kubeseal.*linux-${ARCH}(\\\\.tar\\\\.gz)?$\"))" | head -n1 || true)"
-
           if [[ -n "$DL_URL" ]]; then
             FILE="${DL_URL##*/}"
-            echo "Downloading kubeseal asset: $FILE"
             curl -fsSL -o "$FILE" "$DL_URL"
             if [[ "$FILE" == *.tar.gz ]]; then
               tar -xzf "$FILE"
@@ -255,9 +254,8 @@ jobs:
               sudo install -m 0755 "$FILE" /usr/local/bin/kubeseal
             fi
           else
-            echo "Falling back to kubeseal v0.26.1 tarball"
-            curl -fsSL -o kubeseal.tgz \
-              "https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.26.1/kubeseal-0.26.1-linux-${ARCH}.tar.gz"
+            echo "Falling back to kubeseal v0.26.1"
+            curl -fsSL -o kubeseal.tgz "https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.26.1/kubeseal-0.26.1-linux-${ARCH}.tar.gz"
             tar -xzf kubeseal.tgz
             sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
           fi
@@ -308,10 +306,12 @@ jobs:
             OUT="/tmp/${NAME}.yaml"
 
             if grep -qE '^apiVersion:\s*v1' <<<"$RAW" && grep -qE '^kind:\s*Secret' <<<"$RAW"; then
+              # force namespace if absent
               awk -v ns="$NS" '
-                /^metadata:/ {print; seen=1; next}
+                /^metadata:/ {print; m=1; next}
+                m && $0 ~ /^  namespace:/ {n=1}
                 {print}
-                END { if (seen && $0 !~ /namespace:/) print "  namespace: " ns }
+                END { if (m && !n) print "  namespace: " ns }
               ' <<<"$RAW" > "$OUT"
             elif jq -e . >/dev/null 2>&1 <<<"$RAW"; then
               {
@@ -352,16 +352,11 @@ jobs:
 
           mkdir -p "aks-yaml/secrets/${ENV}"
           shopt -s nullglob
-          files=(/tmp/*.yaml)
-          if ((${#files[@]}==0)); then
-            echo "No secrets to seal."
-          else
-            for f in "${files[@]}"; do
-              base="$(basename "$f" .yaml)"
-              kubeseal --format yaml --cert pubcert.pem < "$f" > "aks-yaml/secrets/${ENV}/${base}-sealed.yaml"
-              echo "sealed: ${base}"
-            done
-          fi
+          for f in /tmp/*.yaml; do
+            base="$(basename "$f" .yaml)"
+            kubeseal --format yaml --cert pubcert.pem < "$f" > "aks-yaml/secrets/${ENV}/${base}-sealed.yaml"
+            echo "sealed: ${base}"
+          done
           shopt -u nullglob
 
           git config user.email "github-actions@users.noreply.github.com"
@@ -400,7 +395,6 @@ jobs:
               --namespace argocd --create-namespace \
               --values "$VALUES" --wait --timeout 10m
           else
-            echo "Values file not found ($VALUES); installing with defaults."
             helm upgrade -i argocd argo/argo-cd \
               --namespace argocd --create-namespace \
               --wait --timeout 10m
@@ -412,10 +406,14 @@ jobs:
           ENV: ${{ needs.build.outputs.ENV }}
         run: |
           set -euo pipefail
-          SECRETS_APP="aks-yaml/argocd/app-secrets-${ENV}.yaml"
-          ROOT_APP="aks-yaml/argocd/app-${ENV}.yaml"
-          kubectl apply -f "$SECRETS_APP"
-          kubectl apply -f "$ROOT_APP"
+          apply_if_exists () { [[ -f "$1" ]] && kubectl apply -f "$1" || echo "skip $1"; }
+
+          apply_if_exists "aks-yaml/argocd/app-secrets-${ENV}.yaml"
+          apply_if_exists "aks-yaml/argocd/app-${ENV}.yaml"
+
+          # Optional monitoring via Argo (keep only if you DID NOT move to Ansible)
+          apply_if_exists "aks-yaml/argocd-app-kube-prometheus-stack.yml"
+          apply_if_exists "aks-yaml/argocd-app-grafana.yml"
 
       - name: Show ArgoCD Applications
         shell: bash

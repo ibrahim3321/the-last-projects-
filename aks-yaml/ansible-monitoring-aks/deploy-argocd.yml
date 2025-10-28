@@ -2,7 +2,7 @@
 - name: Deploy Argo CD on AKS
   hosts: localhost
   connection: local
-  gather_facts: yes
+  gather_facts: no
 
   vars:
     kube_namespace: argocd
@@ -17,8 +17,7 @@
         definition:
           apiVersion: v1
           kind: Namespace
-          metadata:
-            name: "{{ kube_namespace }}"
+          metadata: { name: "{{ kube_namespace }}" }
 
     - name: Add Helm repo for Argo
       kubernetes.core.helm_repository:
@@ -32,16 +31,7 @@
         chart_ref: "{{ argocd_chart }}"
         release_namespace: "{{ kube_namespace }}"
         create_namespace: false
-        values_files:
-          - "{{ argocd_values_file }}"
+        values_files: [ "{{ argocd_values_file }}" ]
         wait: true
-        timeout: "10m"         
-        atomic: true            
-
-    - name: Show Argo CD services
-      command: kubectl get svc -n {{ kube_namespace }}
-      register: svc_output
-
-    - debug:
-        var: svc_output.stdout_lines
-
+        timeout: 600
+        atomic: true

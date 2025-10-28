@@ -1,11 +1,10 @@
+# aks-yaml/base/frontend-config.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: frontend-config
-  namespace: default
 data:
   config.json: |
     {
-      "API_URL": "http://4.253.11.59/api"
+      "API_URL": "/api"
     }
-
