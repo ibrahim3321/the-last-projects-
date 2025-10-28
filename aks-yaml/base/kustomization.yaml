@@ -1,18 +1,17 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-# base namespace is ignored by overlays (they override)
 namespace: default
 
 resources:
-  - backend-config.yaml
-  - backend-deployment.yaml
-  - backend-svc.yaml
-  - frontend-config.yaml
-  - frontend-deployment.yaml
-  - frontend-svc.yaml
-  - mssql-deployment.yaml
-  - mssql-pvc.yaml
-  - mssql-svc.yaml
-  - mssql-bootstrap.yaml
-  - web-ingress.yaml
-  - api-ingress.yaml
+  - backend-config.yml
+  - backend-deployment.yml
+  - backend-svc.yml
+  - frontend-config.yml
+  - frontend-deployment.yml
+  - frontend-svc.yml
+  - mssql-deployment.yml
+  - mssql-pvc.yml
+  - mssql-svc.yml
+  - mssql-bootstrap.yml
+  - web-ingress.yml
+  - api-ingress.yml
