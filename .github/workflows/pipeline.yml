@@ -9,7 +9,6 @@ on:
         description: "dev or prod (override branch mapping)"
         type: choice
         options: [dev, prod]
-        required: false
       enable_agic:
         description: "Enable AGIC via az aks enable-addons"
         type: choice
@@ -20,18 +19,9 @@ on:
         type: choice
         options: ["yes", "no"]
         default: "yes"
-      manage_secrets:
-        description: "Generate & commit sealed-secrets from GitHub Secrets if needed"
-        type: choice
-        options: ["auto", "yes", "no"]
-        default: "auto"
 
 env:
   REGISTRY_FQDN_SUFFIX: azurecr.io
-
-concurrency:
-  group: ci-infra-deploy-${{ github.ref_name }}
-  cancel-in-progress: false
 
 jobs:
   select-env:
@@ -58,39 +48,28 @@ jobs:
   build:
     needs: [select-env]
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
+    permissions: { id-token: write, contents: read }
     outputs:
-      ACR_FQDN: ${{ steps.acr.outputs.ACR_FQDN }}
       IMAGE_TAG_SUFFIX: ${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
       ENV: ${{ needs.select-env.outputs.ENV }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Derive ACR FQDN and login
-        id: acr
+      - name: Login to ACR
         shell: bash
-        run: |
-          set -euo pipefail
-          ACR_NAME="${{ secrets.ACR_NAME }}"
-          echo "ACR_FQDN=${ACR_NAME}.${REGISTRY_FQDN_SUFFIX}" >> "$GITHUB_OUTPUT"
-          az acr login --name "$ACR_NAME"
+        run: az acr login --name "${{ secrets.ACR_NAME }}"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Metadata (labels/tags)
         id: meta
         shell: bash
-        run: |
-          echo "IMAGE_TAG_SUFFIX=${GITHUB_SHA}-${{ needs.select-env.outputs.ENV }}" >> "$GITHUB_OUTPUT"
+        run: echo "IMAGE_TAG_SUFFIX=${GITHUB_SHA}-${{ needs.select-env.outputs.ENV }}" >> "$GITHUB_OUTPUT"
 
       - name: Build & push backend
         uses: docker/build-push-action@v5
@@ -98,10 +77,10 @@ jobs:
           context: ./backend
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR_FQDN }}/backend:latest-${{ needs.select-env.outputs.ENV }}
-            ${{ steps.acr.outputs.ACR_FQDN }}/backend:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
-          cache-from: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/backend:buildcache
-          cache-to: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/backend:buildcache,mode=max
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/backend:latest-${{ needs.select-env.outputs.ENV }}
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/backend:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
+          cache-from: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/backend:buildcache
+          cache-to: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/backend:buildcache,mode=max
 
       - name: Build & push frontend
         uses: docker/build-push-action@v5
@@ -109,44 +88,39 @@ jobs:
           context: ./frontend
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR_FQDN }}/frontend:latest-${{ needs.select-env.outputs.ENV }}
-            ${{ steps.acr.outputs.ACR_FQDN }}/frontend:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
-          cache-from: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/frontend:buildcache
-          cache-to: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/frontend:buildcache,mode=max
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:latest-${{ needs.select-env.outputs.ENV }}
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
+          cache-from: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:buildcache
+          cache-to: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:buildcache,mode=max
 
       - name: Build & push callmebot-adapter
-        if: ${{ hashFiles('aks-yaml/callmebot/**') != '' }}
         uses: docker/build-push-action@v5
         with:
           context: ./aks-yaml/callmebot
           push: true
           tags: |
-            ${{ steps.acr.outputs.ACR_FQDN }}/callmebot-adapter:latest-${{ needs.select-env.outputs.ENV }}
-            ${{ steps.acr.outputs.ACR_FQDN }}/callmebot-adapter:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
-          cache-from: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/callmebot-adapter:buildcache
-          cache-to: type=registry,ref=${{ steps.acr.outputs.ACR_FQDN }}/callmebot-adapter:buildcache,mode=max
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/callmebot-adapter:latest-${{ needs.select-env.outputs.ENV }}
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/callmebot-adapter:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
+          cache-from: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/callmebot-adapter:buildcache
+          cache-to: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/callmebot-adapter:buildcache,mode=max
 
   infra:
     needs: [build]
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    env:
-      TF_IN_AUTOMATION: "true"
+    permissions: { id-token: write, contents: read }
+    env: { TF_IN_AUTOMATION: "true" }
     outputs:
       AKS_NAME: ${{ steps.aksnames.outputs.AKS }}
       RG_NAME:  ${{ steps.aksnames.outputs.RG }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Export ARM env for Terraform (SP + secret)
+      - name: Export ARM env for Terraform
         shell: bash
         run: |
           set -euo pipefail
@@ -170,16 +144,14 @@ jobs:
         working-directory: ./terraform
         shell: bash
         run: |
-          set -euo pipefail     
+          set -euo pipefail
           ENV="${{ needs.build.outputs.ENV }}"
           if [[ "$ENV" == "prod" ]]; then RAW='${{ secrets.PROD }}'; else RAW='${{ secrets.DEV }}'; fi
           echo "$RAW" | jq --arg acr_id "${{ steps.acr.outputs.ACR_ID }}" '. + {acr_id:$acr_id}' > env.auto.tfvars.json
           jq -r 'keys[]' env.auto.tfvars.json | sed 's/^/tfvar: /'
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.9.5
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.9.5 }
 
       - name: Terraform Init/Plan/Apply
         working-directory: ./terraform
@@ -198,8 +170,8 @@ jobs:
           set -euo pipefail
           RG=$(jq -r '.resource_group_name' env.auto.tfvars.json)
           PREFIX=$(jq -r '.resource_prefix' env.auto.tfvars.json)
-          echo "RG=$RG"             >> "$GITHUB_OUTPUT"
-          echo "AKS=${PREFIX}-aks"  >> "$GITHUB_OUTPUT"
+          echo "RG=$RG"            >> "$GITHUB_OUTPUT"
+          echo "AKS=${PREFIX}-aks" >> "$GITHUB_OUTPUT"
 
       - name: (Optional) Enable AGIC
         if: ${{ github.event.inputs.enable_agic == 'yes' || github.event_name != 'workflow_dispatch' }}
@@ -216,11 +188,12 @@ jobs:
   deploy:
     needs: [infra, build]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    permissions: { contents: write }
+    env:
+      ENV: ${{ needs.build.outputs.ENV }}
+      ACR_FQDN: ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}   # ← no outputs needed
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Azure Login
         uses: azure/login@v1
@@ -237,56 +210,33 @@ jobs:
             --admin --overwrite-existing
 
       - name: Install tools (helm, kubeseal, yq, kustomize)
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        env: { GH_TOKEN: ${{ secrets.GH_TOKEN }} }
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y && sudo apt-get install -y jq curl tar
           sudo snap install helm --classic
-
-          ARCH="$(uname -m)"; case "$ARCH" in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) echo "Unsupported arch: $(uname -m)"; exit 1;; esac
-
+          ARCH="$(uname -m)"; case "$ARCH" in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) echo "Unsupported arch"; exit 1;; esac
           API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest"
-          AUTH_H=""
-          [[ -n "${GH_TOKEN:-}" ]] && AUTH_H="-H Authorization: Bearer $GH_TOKEN"
+          AUTH_H=""; [[ -n "${GH_TOKEN:-}" ]] && AUTH_H="-H Authorization: Bearer $GH_TOKEN"
           DL_URL="$(curl -fsSL $AUTH_H -H 'Accept: application/vnd.github+json' "$API_URL" \
-                     | jq -r ".assets[]?.browser_download_url
-                              | select(test(\"kubeseal.*linux-${ARCH}(\\\\.tar\\\\.gz)?$\"))" | head -n1 || true)"
-          if [[ -n "$DL_URL" ]]; then
-            FILE="${DL_URL##*/}"
-            curl -fsSL -o "$FILE" "$DL_URL"
-            if [[ "$FILE" == *.tar.gz ]]; then
-              tar -xzf "$FILE"
-              sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
-            else
-              sudo install -m 0755 "$FILE" /usr/local/bin/kubeseal
-            fi
-          else
+                     | jq -r ".assets[]?.browser_download_url | select(test(\"kubeseal.*linux-${ARCH}(\\\\.tar\\\\.gz)?$\"))" | head -n1 || true)"
+          if [[ -n "$DL_URL" ]]; then FILE="${DL_URL##*/}"; curl -fsSL -o "$FILE" "$DL_URL"; [[ "$FILE" == *.tar.gz ]] && tar -xzf "$FILE" && sudo install -m 0755 kubeseal /usr/local/bin/kubeseal || sudo install -m 0755 "$FILE" /usr/local/bin/kubeseal; else
             curl -fsSL -o kubeseal.tgz "https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.26.1/kubeseal-0.26.1-linux-${ARCH}.tar.gz"
-            tar -xzf kubeseal.tgz
-            sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
+            tar -xzf kubeseal.tgz && sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
           fi
-
           sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_${ARCH}"
           sudo chmod +x /usr/local/bin/yq
-
           KUSTOMIZE_VERSION="5.4.2"
-          curl -fsSL -o kustomize.tar.gz \
-            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz"
-          tar -xzf kustomize.tar.gz
-          sudo install -m 0755 kustomize /usr/local/bin/kustomize
+          curl -fsSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz"
+          tar -xzf kustomize.tar.gz && sudo install -m 0755 kustomize /usr/local/bin/kustomize
 
       - name: Sanity check Kustomize (fail fast)
         shell: bash
-        env:
-          ENV: ${{ needs.build.outputs.ENV }}
         run: |
           set -euo pipefail
-          echo "==> kustomize build aks-yaml/secrets/${ENV}"
-          kustomize build "aks-yaml/secrets/${ENV}" >/dev/null
-          echo "==> kustomize build aks-yaml/overlays/${ENV}"
-          kustomize build "aks-yaml/overlays/${ENV}" >/dev/null
+          kustomize build "aks-yaml/secrets/${ENV}"       >/dev/null
+          kustomize build "aks-yaml/overlays/${ENV}"      >/dev/null
 
       - name: Install Sealed-Secrets controller (Helm)
         shell: bash
@@ -296,114 +246,13 @@ jobs:
           helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
             --namespace kube-system --create-namespace --wait --timeout 10m
 
-      - name: Ensure target namespaces exist (defensive)
-        shell: bash
-        run: |
-          kubectl get ns dev        >/dev/null 2>&1 || kubectl create ns dev
-          kubectl get ns monitoring >/dev/null 2>&1 || kubectl create ns monitoring
-          kubectl get ns argocd     >/dev/null 2>&1 || kubectl create ns argocd
-
       - name: Fetch Sealed-Secrets public cert
         shell: bash
-        run: |
-          set -euo pipefail
-          kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
-
-      - name: Build & seal Secrets from GitHub Secrets (auto/optional)
-        if: ${{ github.event.inputs.manage_secrets != 'no' }}
-        shell: bash
-        env:
-          ENV:              ${{ needs.build.outputs.ENV }}
-          SLACK_RAW:        ${{ secrets.SLACK_WEBHOOK_SECRETS }}
-          CALLMEBOT_RAW:    ${{ secrets.CALLMEBOT_SECRETS }}
-          MSSQL_RAW:        ${{ secrets.MSSQL_SECRETS }}
-          GRAFANA_RAW:      ${{ secrets.GRAFANA_CREDENTIALS }}
-          GRAFANA_RAW_FALL: ${{ secrets.GRAFANA_CREDENTILALS }}   # fallback if old typo secret still used
-          MODE:             ${{ github.event.inputs.manage_secrets }}
-        run: |
-          set -euo pipefail
-
-          # Skip if files already exist and mode is auto
-          if [[ "${MODE:-auto}" == "auto" ]] && ls "aks-yaml/secrets/${ENV}/"*sealed.yaml >/dev/null 2>&1; then
-            echo "Sealed-secret files already present; skipping (auto mode)."
-            exit 0
-          fi
-
-          # Prefer corrected GRAFANA_CREDENTIALS; fall back to old one if empty
-          if [[ -z "${GRAFANA_RAW}" && -n "${GRAFANA_RAW_FALL}" ]]; then GRAFANA_RAW="${GRAFANA_RAW_FALL}"; fi
-
-          norm() { tr -d '\r' <<<"$1"; }
-
-          write_secret_manifest () {
-            local NAME="$1" NS="$2" RAW OUT
-            RAW="$(norm "$3")"
-            [[ -z "$RAW" || "$RAW" == "null" ]] && { echo "::warning title=${NAME}::Secret empty; skip"; return 0; }
-            OUT="/tmp/${NAME}.yaml"
-
-            if grep -qE '^apiVersion:\s*v1' <<<"$RAW" && grep -qE '^kind:\s*Secret' <<<"$RAW"; then
-              awk -v ns="$NS" '
-                /^metadata:/ {print; m=1; next}
-                m && $0 ~ /^  namespace:/ {n=1}
-                {print}
-                END { if (m && !n) print "  namespace: " ns }
-              ' <<<"$RAW" > "$OUT"
-            elif jq -e . >/dev/null 2>&1 <<<"$RAW"; then
-              {
-                echo "apiVersion: v1"
-                echo "kind: Secret"
-                echo "metadata:"
-                echo "  name: ${NAME}"
-                echo "  namespace: ${NS}"
-                echo "type: Opaque"
-                echo "stringData:"
-                jq -r 'to_entries[] | "  \(.key): |\n    \(.value|tostring)"' <<<"$RAW"
-              } > "$OUT"
-            else
-              {
-                echo "apiVersion: v1"
-                echo "kind: Secret"
-                echo "metadata:"
-                echo "  name: ${NAME}"
-                echo "  namespace: ${NS}"
-                echo "type: Opaque"
-                echo "stringData:"
-                while IFS= read -r line; do
-                  [[ -z "$line" || "$line" =~ ^# ]] && continue
-                  if [[ "$line" =~ ^[^=[:space:]]+= ]]; then
-                    key="${line%%=*}"; val="${line#*=}"
-                    printf '  %s: |\n    %s\n' "$key" "$val"
-                  fi
-                done <<<"$RAW"
-              } > "$OUT"
-            fi
-            grep -q '^kind: Secret' "$OUT"
-          }
-
-          write_secret_manifest slack-webhook-url           monitoring "$SLACK_RAW"
-          write_secret_manifest callmebot-config            monitoring "$CALLMEBOT_RAW"
-          write_secret_manifest grafana-admin-credentials   monitoring "$GRAFANA_RAW"
-          write_secret_manifest mssql-secret                default    "$MSSQL_RAW"
-
-          mkdir -p "aks-yaml/secrets/${ENV}"
-          shopt -s nullglob
-          for f in /tmp/*.yaml; do
-            base="$(basename "$f" .yaml)"
-            kubeseal --format yaml --cert pubcert.pem < "$f" > "aks-yaml/secrets/${ENV}/${base}-sealed.yaml"
-            echo "sealed: ${base}"
-          done
-          shopt -u nullglob
-
-          git config user.email "github-actions@users.noreply.github.com"
-          git config user.name  "github-actions"
-          git add "aks-yaml/secrets/${ENV}" || true
-          git commit -m "ci: sealed-secrets (${ENV}) [skip ci]" || echo "No changes"
-          git push || true
+        run: kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
 
       - name: Patch overlays with ACR + image tag
         shell: bash
         env:
-          ENV:           ${{ needs.build.outputs.ENV }}
-          ACR_FQDN:      ${{ needs.build.outputs.ACR_FQDN }}
           IMAGE_TAG:     ${{ needs.build.outputs.IMAGE_TAG_SUFFIX }}
           PIN_SHA_INPUT: ${{ github.event.inputs.pin_sha }}
         run: |
@@ -414,6 +263,8 @@ jobs:
           if [[ "${PIN_SHA_INPUT:-yes}" == "yes" ]]; then
             sed -i "s#latest-${ENV}#${IMAGE_TAG}#g" "$PATCH"
           fi
+          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name  "github-actions"
           git add "$PATCH" || true
           git commit -m "ci: patch images (${ENV}) [skip ci]" || echo "No changes"
           git push || true
@@ -425,32 +276,18 @@ jobs:
           helm repo add argo https://argoproj.github.io/argo-helm
           VALUES="aks-yaml/ansible-monitoring-aks/values-argocd.yaml"
           if [[ -f "$VALUES" ]]; then
-            helm upgrade -i argocd argo/argo-cd \
-              --namespace argocd --create-namespace \
-              --values "$VALUES" --wait --timeout 10m
+            helm upgrade -i argocd argo/argo-cd --namespace argocd --create-namespace --values "$VALUES" --wait --timeout 10m
           else
-            helm upgrade -i argocd argo/argo-cd \
-              --namespace argocd --create-namespace \
-              --wait --timeout 10m
+            helm upgrade -i argocd argo/argo-cd --namespace argocd --create-namespace --wait --timeout 10m
           fi
 
       - name: Bootstrap Argo applications
         shell: bash
-        env:
-          ENV: ${{ needs.build.outputs.ENV }}
         run: |
           set -euo pipefail
           apply_if_exists () { [[ -f "$1" ]] && kubectl apply -f "$1" || echo "skip $1"; }
-
-          # These must point to:
-          #   app-secrets-<env>.yaml: spec.source.path: aks-yaml/secrets/<env>
-          #   app-<env>.yaml:        spec.source.path: aks-yaml/overlays/<env>
           apply_if_exists "aks-yaml/argocd/app-secrets-${ENV}.yaml"
           apply_if_exists "aks-yaml/argocd/app-${ENV}.yaml"
-
-          # Optional monitoring apps if present
-          apply_if_exists "aks-yaml/argocd-app-kube-prometheus-stack.yml"
-          apply_if_exists "aks-yaml/argocd-app-grafana.yml"
 
       - name: Show ArgoCD Applications
         shell: bash
