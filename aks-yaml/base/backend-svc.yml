@@ -1,11 +1,12 @@
 apiVersion: v1
-kind: ConfigMap
+kind: Service
 metadata:
-  name: backend-config
-data:
-  # Use service short name; overlay namespace (dev/prod) will scope DNS.
-  DB_HOST: mssql-service
-  DB_PORT: "1433"
-  DB_NAME: burgerbuilder
-  DB_USERNAME: sa
-  SERVER_PORT: "8080"
+  name: backend-service
+spec:
+  selector:
+    app: backend
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP  
