@@ -9,6 +9,7 @@ on:
         description: "dev or prod (override branch mapping)"
         type: choice
         options: [dev, prod]
+        required: false
       enable_agic:
         description: "Enable AGIC via az aks enable-addons"
         type: choice
@@ -48,7 +49,9 @@ jobs:
   build:
     needs: [select-env]
     runs-on: ubuntu-latest
-    permissions: { id-token: write, contents: read }
+    permissions:
+      id-token: write
+      contents: read
     outputs:
       IMAGE_TAG_SUFFIX: ${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
       ENV: ${{ needs.select-env.outputs.ENV }}
@@ -107,8 +110,11 @@ jobs:
   infra:
     needs: [build]
     runs-on: ubuntu-latest
-    permissions: { id-token: write, contents: read }
-    env: { TF_IN_AUTOMATION: "true" }
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      TF_IN_AUTOMATION: "true"
     outputs:
       AKS_NAME: ${{ steps.aksnames.outputs.AKS }}
       RG_NAME:  ${{ steps.aksnames.outputs.RG }}
@@ -140,6 +146,10 @@ jobs:
           ACR_ID=$(az acr show -n "${{ secrets.ACR_NAME }}" --query id -o tsv)
           echo "ACR_ID=$ACR_ID" >> "$GITHUB_OUTPUT"
 
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
       - name: Write env.auto.tfvars.json from JSON secret
         working-directory: ./terraform
         shell: bash
@@ -149,9 +159,6 @@ jobs:
           if [[ "$ENV" == "prod" ]]; then RAW='${{ secrets.PROD }}'; else RAW='${{ secrets.DEV }}'; fi
           echo "$RAW" | jq --arg acr_id "${{ steps.acr.outputs.ACR_ID }}" '. + {acr_id:$acr_id}' > env.auto.tfvars.json
           jq -r 'keys[]' env.auto.tfvars.json | sed 's/^/tfvar: /'
-
-      - uses: hashicorp/setup-terraform@v3
-        with: { terraform_version: 1.9.5 }
 
       - name: Terraform Init/Plan/Apply
         working-directory: ./terraform
@@ -188,10 +195,10 @@ jobs:
   deploy:
     needs: [infra, build]
     runs-on: ubuntu-latest
-    permissions: { contents: write }
+    permissions:
+      contents: write
     env:
       ENV: ${{ needs.build.outputs.ENV }}
-      ACR_FQDN: ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}   # ← no outputs needed
     steps:
       - uses: actions/checkout@v4
 
@@ -210,8 +217,8 @@ jobs:
             --admin --overwrite-existing
 
       - name: Install tools (helm, kubeseal, yq, kustomize)
-        env: 
-         GH_TOKEN: ${{ secrets.GH_TOKEN }} }
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -222,7 +229,11 @@ jobs:
           AUTH_H=""; [[ -n "${GH_TOKEN:-}" ]] && AUTH_H="-H Authorization: Bearer $GH_TOKEN"
           DL_URL="$(curl -fsSL $AUTH_H -H 'Accept: application/vnd.github+json' "$API_URL" \
                      | jq -r ".assets[]?.browser_download_url | select(test(\"kubeseal.*linux-${ARCH}(\\\\.tar\\\\.gz)?$\"))" | head -n1 || true)"
-          if [[ -n "$DL_URL" ]]; then FILE="${DL_URL##*/}"; curl -fsSL -o "$FILE" "$DL_URL"; [[ "$FILE" == *.tar.gz ]] && tar -xzf "$FILE" && sudo install -m 0755 kubeseal /usr/local/bin/kubeseal || sudo install -m 0755 "$FILE" /usr/local/bin/kubeseal; else
+          if [[ -n "$DL_URL" ]]; then
+            FILE="${DL_URL##*/}"; curl -fsSL -o "$FILE" "$DL_URL"
+            if [[ "$FILE" == *.tar.gz ]]; then tar -xzf "$FILE"; sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
+            else sudo install -m 0755 "$FILE" /usr/local/bin/kubeseal; fi
+          else
             curl -fsSL -o kubeseal.tgz "https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.26.1/kubeseal-0.26.1-linux-${ARCH}.tar.gz"
             tar -xzf kubeseal.tgz && sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
           fi
@@ -232,12 +243,16 @@ jobs:
           curl -fsSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz"
           tar -xzf kustomize.tar.gz && sudo install -m 0755 kustomize /usr/local/bin/kustomize
 
+      - name: Compute ACR_FQDN for this job
+        shell: bash
+        run: echo "ACR_FQDN=${{ secrets.ACR_NAME }}.${REGISTRY_FQDN_SUFFIX}" >> $GITHUB_ENV
+
       - name: Sanity check Kustomize (fail fast)
         shell: bash
         run: |
           set -euo pipefail
-          kustomize build "aks-yaml/secrets/${ENV}"       >/dev/null
-          kustomize build "aks-yaml/overlays/${ENV}"      >/dev/null
+          kustomize build "aks-yaml/secrets/${ENV}"  >/dev/null
+          kustomize build "aks-yaml/overlays/${ENV}" >/dev/null
 
       - name: Install Sealed-Secrets controller (Helm)
         shell: bash
@@ -246,6 +261,13 @@ jobs:
           helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
           helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
             --namespace kube-system --create-namespace --wait --timeout 10m
+
+      - name: Ensure target namespaces exist (defensive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl get ns dev        >/dev/null 2>&1 || kubectl create ns dev
+          kubectl get ns monitoring >/dev/null 2>&1 || kubectl create ns monitoring
 
       - name: Fetch Sealed-Secrets public cert
         shell: bash
