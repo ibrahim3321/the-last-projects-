@@ -67,6 +67,7 @@ jobs:
       - name: Derive ACR FQDN and login
         id: acr
         run: |
+          set -euo pipefail
           ACR_NAME="${{ secrets.ACR_NAME }}"
           echo "ACR_FQDN=${ACR_NAME}.${REGISTRY_FQDN_SUFFIX}" >> $GITHUB_OUTPUT
           az acr login --name "${ACR_NAME}"
@@ -77,8 +78,7 @@ jobs:
       - name: Metadata (labels/tags)
         id: meta
         run: |
-          ENV="${{ needs.select-env.outputs.ENV }}"
-          echo "IMAGE_TAG_SUFFIX=${GITHUB_SHA}-${ENV}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG_SUFFIX=${GITHUB_SHA}-${{ needs.select-env.outputs.ENV }}" >> $GITHUB_OUTPUT
 
       # Backend
       - name: Build & push backend
@@ -136,9 +136,9 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Use SP + client secret with Terraform (not CLI-as-user)
       - name: Export ARM env for Service Principal
         run: |
+          set -euo pipefail
           sudo apt-get update -y && sudo apt-get install -y jq
           CREDS='${{ secrets.AZURE_CREDENTIALS }}'
           ARM_CLIENT_ID=$(echo "$CREDS" | jq -r '.clientId // .appId')
@@ -154,13 +154,14 @@ jobs:
       - name: Pull external ACR id
         id: acr
         run: |
+          set -euo pipefail
           ACR_ID=$(az acr show -n "${{ secrets.ACR_NAME }}" --query id -o tsv)
           echo "ACR_ID=$ACR_ID" >> $GITHUB_OUTPUT
 
-      # Write JSON tfvars (auto-loaded by Terraform) + merge acr_id
       - name: Write env.auto.tfvars.json from JSON secret
         working-directory: ./terraform
         run: |
+          set -euo pipefail
           ENV="${{ needs.build.outputs.ENV }}"
           if [ "$ENV" = "prod" ]; then
             RAW='${{ secrets.PROD }}'
@@ -168,7 +169,6 @@ jobs:
             RAW='${{ secrets.DEV }}'
           fi
           echo "$RAW" | jq --arg acr_id "${{ steps.acr.outputs.ACR_ID }}" '. + {acr_id:$acr_id}' > env.auto.tfvars.json
-          # show only keys for visibility
           jq -r 'keys[]' env.auto.tfvars.json | sed 's/^/tfvar: /'
 
       - name: Setup Terraform
@@ -176,13 +176,10 @@ jobs:
         with:
           terraform_version: 1.9.5
 
-      # If your azurerm backend has account keys disabled:
-      #   use_azuread_auth = true
-      # and grant the SP Storage Blob Data Owner on the state account.
-
       - name: Terraform Init/Plan/Apply
         working-directory: ./terraform
         run: |
+          set -euo pipefail
           terraform init -upgrade
           terraform plan -out=tfplan
           terraform apply -auto-approve tfplan
@@ -191,6 +188,7 @@ jobs:
         id: aksnames
         working-directory: ./terraform
         run: |
+          set -euo pipefail
           RG=$(jq -r '.resource_group_name' env.auto.tfvars.json)
           PREFIX=$(jq -r '.resource_prefix' env.auto.tfvars.json)
           echo "RG=$RG" >> $GITHUB_OUTPUT
@@ -199,6 +197,7 @@ jobs:
       - name: (Optional) Enable AGIC
         if: ${{ github.event.inputs.enable_agic == 'yes' || github.event_name != 'workflow_dispatch' }}
         run: |
+          set -euo pipefail
           AKS_NAME="${{ steps.aksnames.outputs.AKS }}"
           RESOURCE_GROUP="${{ steps.aksnames.outputs.RG }}"
           az aks enable-addons \
@@ -226,6 +225,7 @@ jobs:
 
       - name: Get AKS kubeconfig
         run: |
+          set -euo pipefail
           az aks get-credentials \
             -g "${{ needs.infra.outputs.RG_NAME }}" \
             -n "${{ needs.infra.outputs.AKS_NAME }}" \
@@ -233,31 +233,56 @@ jobs:
 
       - name: Install tools (helm, kubeseal, yq, kustomize)
         run: |
+          set -euo pipefail
+
+          # Helm
           sudo snap install helm --classic
-          KUBSEAL_VERSION="0.27.2"
-          curl -L -o kubeseal https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBSEAL_VERSION}/kubeseal-linux-amd64
+
+          # kubeseal (robust download + verify)
+          KUBSEAL_VERSION="${KUBSEAL_VERSION:-0.27.2}"
+          URL="https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBSEAL_VERSION}/kubeseal-linux-amd64"
+          echo "Downloading kubeseal ${KUBSEAL_VERSION} from ${URL}"
+          if ! curl -fsSL -o kubeseal "${URL}"; then
+            echo "Primary kubeseal download failed; falling back to 0.26.1"
+            KUBSEAL_VERSION="0.26.1"
+            URL="https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBSEAL_VERSION}/kubeseal-linux-amd64"
+            curl -fsSL -o kubeseal "${URL}"
+          fi
           sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          /usr/local/bin/kubeseal --version
+
+          # yq
+          sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64"
           sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+          # kustomize
           KUSTOMIZE_VERSION="5.4.2"
-          curl -sSLo kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz
+          curl -fsSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
           tar -xzf kustomize.tar.gz
           sudo install -m 0755 kustomize /usr/local/bin/kustomize
+          kustomize version
 
       - name: Install Sealed-Secrets controller
         run: |
+          set -euo pipefail
           helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
           helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
             --namespace kube-system --create-namespace --wait --timeout 10m
 
       - name: Fetch Sealed-Secrets cert
-        run: kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
+        run: |
+          set -euo pipefail
+          kubeseal --controller-namespace kube-system --controller-name sealed-secrets --fetch-cert > pubcert.pem
 
       - name: Prepare env folder
-        run: mkdir -p "aks-yaml/secrets/${{ needs.build.outputs.ENV }}"
+        run: |
+          set -euo pipefail
+          mkdir -p "aks-yaml/secrets/${{ needs.build.outputs.ENV }}"
 
       - name: Write plain Secret yamls (from repo secrets)
         run: |
+          set -euo pipefail
           printf "%s\n" '${{ secrets.SLACK_WEBHOOK_SECRETS }}' > /tmp/slack.yaml
           printf "%s\n" '${{ secrets.CALLMEBOT_SECRETS }}'     > /tmp/callmebot.yaml
           printf "%s\n" '${{ secrets.MSSQL_SECRETS }}'         > /tmp/mssql.yaml
@@ -265,6 +290,7 @@ jobs:
 
       - name: Seal secrets → commit
         run: |
+          set -euo pipefail
           ENV="${{ needs.build.outputs.ENV }}"
           for s in slack callmebot mssql grafana; do
             kubeseal --format yaml --cert pubcert.pem < "/tmp/${s}.yaml" > "aks-yaml/secrets/${ENV}/${s}-sealed.yaml"
@@ -277,6 +303,7 @@ jobs:
 
       - name: Patch image registry & tag in overlay
         run: |
+          set -euo pipefail
           ENV="${{ needs.build.outputs.ENV }}"
           ACR_FQDN="${{ needs.build.outputs.ACR_FQDN }}"
           PATCH="aks-yaml/overlays/${ENV}/patch-images.yaml"
@@ -290,6 +317,7 @@ jobs:
 
       - name: Install Argo CD (Helm)
         run: |
+          set -euo pipefail
           helm repo add argo https://argoproj.github.io/argo-helm
           helm upgrade -i argocd argo/argo-cd \
             --namespace argocd --create-namespace \
@@ -298,6 +326,7 @@ jobs:
 
       - name: Bootstrap Argo applications
         run: |
+          set -euo pipefail
           ENV="${{ needs.build.outputs.ENV }}"
           if [ "$ENV" = "prod" ]; then
             kubectl apply -f aks-yaml/argocd/app-secrets-prod.yaml
@@ -306,7 +335,6 @@ jobs:
             kubectl apply -f aks-yaml/argocd/app-secrets-dev.yaml
             kubectl apply -f aks-yaml/argocd/app-dev.yaml
           fi
-          # kubectl apply -f aks-yaml/argocd/root-app.yaml  # if you use a root app
 
       - name: Show ArgoCD Applications
         run: kubectl get applications.argoproj.io -A
