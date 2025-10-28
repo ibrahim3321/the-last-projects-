@@ -161,6 +161,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          SA="${{ secrets.TFSTATE_ACCOUNT_NAME }}"
+          CN="${{ secrets.TFSTATE_CONTAINER_NAME }}"
+          BLOB="tfstate/terraform.tfstate"
+          az storage blob lease break --account-name "$SA" -c "$CN" -b "$BLOB" || true
           ENV="${{ needs.build.outputs.ENV }}"
           if [[ "$ENV" == "prod" ]]; then RAW='${{ secrets.PROD }}'; else RAW='${{ secrets.DEV }}'; fi
           echo "$RAW" | jq --arg acr_id "${{ steps.acr.outputs.ACR_ID }}" '. + {acr_id:$acr_id}' > env.auto.tfvars.json
