@@ -11,7 +11,7 @@ spec:
     spec:
       containers:
         - name: adapter
-          image: group6kubacr.azurecr.io/callmebot-adapter:v1   # <-- if you used a different tag, update it
+          image: ${ACR_LOGIN_SERVER}/backend:${BACKEND_TAG}   # <-- if you used a different tag, update it
           imagePullPolicy: IfNotPresent
           env:
             - name: CALLMEBOT_BASE_URL
