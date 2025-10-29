@@ -95,7 +95,6 @@ jobs:
           cache-from: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:buildcache
           cache-to: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:buildcache,mode=max
 
-      # Find the correct callmebot Docker context
       - name: Find callmebot build context
         id: cbpath
         shell: bash
@@ -195,19 +194,30 @@ jobs:
           PREFIX=$(jq -r '.resource_prefix' env.auto.tfvars.json)
           echo "RG=$RG"            >> "$GITHUB_OUTPUT"
           echo "AKS=${PREFIX}-aks" >> "$GITHUB_OUTPUT"
-      - name:  Grant AcrPull to kubelet identity (idempotent) 
-        shell: bash 
-        run: | 
+
+      - name: Grant AcrPull to kubelet identity (idempotent)
+        shell: bash
+        run: |
           set -euo pipefail
           KUBELET_OID="$(az aks show -g "${{ steps.aksnames.outputs.RG }}" -n "${{ steps.aksnames.outputs.AKS }}" --query "identityProfile.kubeletidentity.objectId" -o tsv)"
-          ACR_ID="${{ steps.acr.outputs.ACR_ID }}" 
-          HAS_ASSIGNMENT="$(az role assignment list --scope "$ACR_ID" --assignee-object-id "$KUBELET_OID" --query "[?roleDefinitionName=='AcrPull'] | length(@)" -o tsv)"
-          if [[ "${HAS_ASSIGNMENT:-0}" == "0" ]]; then 
-          az role assignment create --assignee-object-id "$KUBELET_OID" --assignee-principal-type ServicePrincipal --role "AcrPull" --scope "$ACR_ID" 
-          else 
-            echo "AcrPull role already present." 
-          if 
-           
+          ACR_ID="${{ steps.acr.outputs.ACR_ID }}"
+
+          HAS_ASSIGNMENT="$(az role assignment list \
+            --scope "$ACR_ID" \
+            --assignee-object-id "$KUBELET_OID" \
+            --query "[?roleDefinitionName=='AcrPull'] | length(@)" -o tsv || echo 0)"
+
+          if [[ "${HAS_ASSIGNMENT:-0}" == "0" ]]; then
+            echo "Creating AcrPull assignment for kubelet identity..."
+            az role assignment create \
+              --assignee-object-id "$KUBELET_OID" \
+              --assignee-principal-type ServicePrincipal \
+              --role "AcrPull" \
+              --scope "$ACR_ID"
+          else
+            echo "AcrPull role already present."
+          fi
+
       - name: (Optional) Enable AGIC
         if: ${{ github.event.inputs.enable_agic == 'yes' || github.event_name != 'workflow_dispatch' }}
         shell: bash
@@ -250,9 +260,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -y && sudo apt-get install -y jq curl tar
+          sudo apt-get update -y && sudo apt-get install -y jq curl tar wget
           sudo snap install helm --classic
           ARCH="$(uname -m)"; case "$ARCH" in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) echo "Unsupported arch"; exit 1;; esac
+
           API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest"
           AUTH_H=""; [[ -n "${GH_TOKEN:-}" ]] && AUTH_H="-H Authorization: Bearer $GH_TOKEN"
           DL_URL="$(curl -fsSL $AUTH_H -H 'Accept: application/vnd.github+json' "$API_URL" \
@@ -265,8 +276,10 @@ jobs:
             curl -fsSL -o kubeseal.tgz "https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.26.1/kubeseal-0.26.1-linux-${ARCH}.tar.gz"
             tar -xzf kubeseal.tgz && sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
           fi
+
           sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_${ARCH}"
           sudo chmod +x /usr/local/bin/yq
+
           KUSTOMIZE_VERSION="5.4.2"
           curl -fsSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz"
           tar -xzf kustomize.tar.gz && sudo install -m 0755 kustomize /usr/local/bin/kustomize
