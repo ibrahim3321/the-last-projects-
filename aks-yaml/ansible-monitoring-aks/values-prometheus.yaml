@@ -51,7 +51,7 @@ alertmanager:
               {{- end }}
       - name: callmebot
         webhook_configs:
-          - url: "http://callmebot-adapter.monitoring.svc.cluster.local:8080/webhook"
+          - url: "http://callmebot-adapter.dev.svc.cluster.local:8080/webhook"
             send_resolved: true
 
 prometheus:

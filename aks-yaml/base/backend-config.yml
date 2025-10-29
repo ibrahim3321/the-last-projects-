@@ -4,7 +4,7 @@ metadata:
   name: backend-config
   
 data:
-  DB_HOST: mssql-service.default.svc.cluster.local
+  DB_HOST: mssql-service
   DB_PORT: "1433"
   DB_NAME: burgerbuilder
   DB_USERNAME: sa
