@@ -9,6 +9,13 @@ This project demonstrates a complete **DevOps lifecycle** — from infrastructur
 The project represents a **three-tier cloud-native application** deployed on **Azure Kubernetes Service (AKS)**.  
 It integrates **Terraform**, **GitHub Actions**, **Ansible**, **SonarQube**, **ArgoCD**, **Prometheus**, and **Grafana** to deliver a fully automated and observable DevOps environment.
 
+<img width="1261" height="709" alt="image" src="https://github.com/user-attachments/assets/b0799a0c-23f1-4153-ab7b-269825927419" />
+<img width="1261" height="709" alt="image" src="https://github.com/user-attachments/assets/d09132d1-4122-4762-bb7f-5a6b5fd673d3" />
+<img width="1261" height="709" alt="image" src="https://github.com/user-attachments/assets/1393dec9-33f4-4381-a94e-86c5e3d83df0" />
+<img width="1261" height="709" alt="image" src="https://github.com/user-attachments/assets/a3b6ba2b-52ec-4d29-91fd-a7fbc4e0734f" />
+<img width="1261" height="709" alt="image" src="https://github.com/user-attachments/assets/5e4c59f7-ae27-473a-b292-7d3ac5d34b7f" />
+
+
 ---
 
 ## Table of Contents
@@ -283,8 +290,8 @@ By integrating tools such as Terraform, AKS, GitHub Actions, and Prometheus, it 
 
 ## 🔗 Related Projects
 
-- [Second Project – 3-Tier Cloud App on AKS](https://github.com/anas-443005129/master_projectg6.git)
-- [Third Project – DevOps Monitoring Pipeline](https://github.com/ibrahim3321/the3rd-fromthelast-project.git)
+- [Second Project – DevOps Advisor](https://github.com/anas-443005129/master_projectg6.git)
+- [Third Project – 3-tir app with full DevOps tools ](https://github.com/ibrahim3321/the3rd-fromthelast-project.git)
 
 
 ---
