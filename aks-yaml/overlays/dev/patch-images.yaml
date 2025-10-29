@@ -7,7 +7,7 @@ spec:
     spec:
       containers:
         - name: backend
-          image: __ACR_FQDN__/backend:latest-dev
+          image: group6acr.azurecr.io/backend:8745c38e29da950cf9c39b80c9a920d1e15f1bfb-dev
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: __ACR_FQDN__/frontend:latest-dev
+          image: group6acr.azurecr.io/frontend:8745c38e29da950cf9c39b80c9a920d1e15f1bfb-dev
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -29,4 +29,4 @@ spec:
     spec:
       containers:
         - name: callmebot-adapter
-          image: __ACR_FQDN__/callmebot-adapter:latest-dev
+          image: group6acr.azurecr.io/callmebot-adapter:8745c38e29da950cf9c39b80c9a920d1e15f1bfb-dev
