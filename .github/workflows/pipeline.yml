@@ -1,0 +1,346 @@
+name: CI → Infra → Deploy (AKS + Argo CD)
+
+on:
+  push:
+    branches: [ main, feature/ci-cd ]
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "dev or prod (override branch mapping)"
+        type: choice
+        options: [dev, prod]
+      enable_agic:
+        description: "Enable AGIC via az aks enable-addons"
+        type: choice
+        options: ["yes", "no"]
+        default: "yes"
+      pin_sha:
+        description: "Pin images to current commit SHA"
+        type: choice
+        options: ["yes", "no"]
+        default: "yes"
+
+env:
+  REGISTRY_FQDN_SUFFIX: azurecr.io
+
+jobs:
+  select-env:
+    runs-on: ubuntu-latest
+    outputs:
+      ENV: ${{ steps.pick.outputs.ENV }}
+    steps:
+      - name: Choose environment
+        id: pick
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.env }}" ]]; then
+            ENV="${{ github.event.inputs.env }}"
+          else
+            case "${GITHUB_REF_NAME}" in
+              main) ENV=prod ;;
+              feature/ci-cd) ENV=dev ;;
+              *) ENV=dev ;;
+            esac
+          fi
+          echo "ENV=$ENV" >> "$GITHUB_OUTPUT"
+          echo "Selected ENV=$ENV"
+
+  build:
+    needs: [select-env]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      IMAGE_TAG_SUFFIX: ${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
+      ENV: ${{ needs.select-env.outputs.ENV }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        shell: bash
+        run: az acr login --name "${{ secrets.ACR_NAME }}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Metadata (labels/tags)
+        id: meta
+        shell: bash
+        run: echo "IMAGE_TAG_SUFFIX=${GITHUB_SHA}-${{ needs.select-env.outputs.ENV }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/backend:latest-${{ needs.select-env.outputs.ENV }}
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/backend:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
+          cache-from: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/backend:buildcache
+          cache-to: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/backend:buildcache,mode=max
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:latest-${{ needs.select-env.outputs.ENV }}
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
+          cache-from: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:buildcache
+          cache-to: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/frontend:buildcache,mode=max
+
+      - name: Find callmebot build context
+        id: cbpath
+        shell: bash
+        run: |
+          set -euo pipefail
+          for p in ./aks-yaml/base/callmebot ./aks-yaml/callmebot ; do
+            if [ -d "$p" ]; then
+              echo "path=$p" >> "$GITHUB_OUTPUT"
+              echo "Docker context: $p"
+              exit 0
+            fi
+          done
+          echo "::error::callmebot context not found (expected ./aks-yaml/base/callmebot or ./aks-yaml/callmebot)"
+          exit 1
+
+      - name: Build & push callmebot-adapter
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ steps.cbpath.outputs.path }}
+          file: ${{ steps.cbpath.outputs.path }}/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/callmebot-adapter:latest-${{ needs.select-env.outputs.ENV }}
+            ${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/callmebot-adapter:${{ steps.meta.outputs.IMAGE_TAG_SUFFIX }}
+          cache-from: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/callmebot-adapter:buildcache
+          cache-to: type=registry,ref=${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}/callmebot-adapter:buildcache,mode=max
+
+  infra:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      TF_IN_AUTOMATION: "true"
+    outputs:
+      AKS_NAME: ${{ steps.aksnames.outputs.AKS }}
+      RG_NAME:  ${{ steps.aksnames.outputs.RG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Export ARM env for Terraform
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y && sudo apt-get install -y jq
+          CREDS='${{ secrets.AZURE_CREDENTIALS }}'
+          echo "ARM_CLIENT_ID=$(echo "$CREDS" | jq -r '.clientId // .appId')"           >> $GITHUB_ENV
+          echo "ARM_CLIENT_SECRET=$(echo "$CREDS" | jq -r '.clientSecret // .password')" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=$(echo "$CREDS" | jq -r '.tenantId // .tenant')"           >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=$(echo "$CREDS" | jq -r '.subscriptionId // .subscription')" >> $GITHUB_ENV
+          echo "ARM_ENVIRONMENT=public" >> $GITHUB_ENV
+
+      - name: Pull external ACR id
+        id: acr
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACR_ID=$(az acr show -n "${{ secrets.ACR_NAME }}" --query id -o tsv)
+          echo "ACR_ID=$ACR_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Write env.auto.tfvars.json from JSON secret
+        working-directory: ./terraform
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV="${{ needs.build.outputs.ENV }}"
+          if [[ "$ENV" == "prod" ]]; then RAW='${{ secrets.PROD }}'; else RAW='${{ secrets.DEV }}'; fi
+          echo "$RAW" | jq --arg acr_id "${{ steps.acr.outputs.ACR_ID }}" '. + {acr_id:$acr_id}' > env.auto.tfvars.json
+          jq -r 'keys[]' env.auto.tfvars.json | sed 's/^/tfvar: /'
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Terraform Init/Plan/Apply
+        working-directory: ./terraform
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform init -upgrade
+          terraform plan -out=tfplan
+          terraform apply -auto-approve tfplan
+
+      - name: Resolve AKS RG/name from tfvars.json
+        id: aksnames
+        working-directory: ./terraform
+        shell: bash
+        run: |
+          set -euo pipefail
+          RG=$(jq -r '.resource_group_name' env.auto.tfvars.json)
+          PREFIX=$(jq -r '.resource_prefix' env.auto.tfvars.json)
+          echo "RG=$RG"            >> "$GITHUB_OUTPUT"
+          echo "AKS=${PREFIX}-aks" >> "$GITHUB_OUTPUT"
+
+      - name: Grant AcrPull to kubelet identity (idempotent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          KUBELET_OID="$(az aks show -g "${{ steps.aksnames.outputs.RG }}" -n "${{ steps.aksnames.outputs.AKS }}" --query "identityProfile.kubeletidentity.objectId" -o tsv)"
+          ACR_ID="${{ steps.acr.outputs.ACR_ID }}"
+
+          HAS_ASSIGNMENT="$(az role assignment list \
+            --scope "$ACR_ID" \
+            --assignee-object-id "$KUBELET_OID" \
+            --query "[?roleDefinitionName=='AcrPull'] | length(@)" -o tsv || echo 0)"
+
+          if [[ "${HAS_ASSIGNMENT:-0}" == "0" ]]; then
+            echo "Creating AcrPull assignment for kubelet identity..."
+            az role assignment create \
+              --assignee-object-id "$KUBELET_OID" \
+              --assignee-principal-type ServicePrincipal \
+              --role "AcrPull" \
+              --scope "$ACR_ID"
+          else
+            echo "AcrPull role already present."
+          fi
+
+      - name: (Optional) Enable AGIC
+        if: ${{ github.event.inputs.enable_agic == 'yes' || github.event_name != 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          az aks enable-addons \
+            -a ingress-appgw \
+            -n "${{ steps.aksnames.outputs.AKS }}" \
+            -g "${{ steps.aksnames.outputs.RG }}" \
+            --appgw-name "${{ steps.aksnames.outputs.AKS }}-appgw" \
+            --appgw-subnet-cidr "10.225.0.0/16"
+
+  deploy:
+    needs: [infra, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      ENV: ${{ needs.build.outputs.ENV }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS kubeconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          az aks get-credentials \
+            -g "${{ needs.infra.outputs.RG_NAME }}" \
+            -n "${{ needs.infra.outputs.AKS_NAME }}" \
+            --admin --overwrite-existing
+
+      - name: Install tools (helm, kubeseal, yq, kustomize)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y && sudo apt-get install -y jq curl tar wget
+          sudo snap install helm --classic
+          ARCH="$(uname -m)"; case "$ARCH" in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) echo "Unsupported arch"; exit 1;; esac
+
+          API_URL="https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest"
+          AUTH_H=""; [[ -n "${GH_TOKEN:-}" ]] && AUTH_H="-H Authorization: Bearer $GH_TOKEN"
+          DL_URL="$(curl -fsSL $AUTH_H -H 'Accept: application/vnd.github+json' "$API_URL" \
+                     | jq -r ".assets[]?.browser_download_url | select(test(\"kubeseal.*linux-${ARCH}(\\\\.tar\\\\.gz)?$\"))" | head -n1 || true)"
+          if [[ -n "$DL_URL" ]]; then
+            FILE="${DL_URL##*/}"; curl -fsSL -o "$FILE" "$DL_URL"
+            if [[ "$FILE" == *.tar.gz ]]; then tar -xzf "$FILE"; sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
+            else sudo install -m 0755 "$FILE" /usr/local/bin/kubeseal; fi
+          else
+            curl -fsSL -o kubeseal.tgz "https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.26.1/kubeseal-0.26.1-linux-${ARCH}.tar.gz"
+            tar -xzf kubeseal.tgz && sudo install -m 0755 kubeseal /usr/local/bin/kubeseal
+          fi
+
+          sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_${ARCH}"
+          sudo chmod +x /usr/local/bin/yq
+
+          KUSTOMIZE_VERSION="5.4.2"
+          curl -fsSL -o kustomize.tar.gz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_${ARCH}.tar.gz"
+          tar -xzf kustomize.tar.gz && sudo install -m 0755 kustomize /usr/local/bin/kustomize
+
+      - name: Sanity check Kustomize (fail fast)
+        shell: bash
+        run: |
+          set -euo pipefail
+          kustomize build "aks-yaml/secrets/${ENV}"  >/dev/null
+          kustomize build "aks-yaml/overlays/${ENV}" >/dev/null
+
+      - name: Install Sealed-Secrets controller (Helm)
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm repo add sealed-secrets https://bitnami-labs.github.io/sealed-secrets
+          helm upgrade -i sealed-secrets sealed-secrets/sealed-secrets \
+            --namespace kube-system --create-namespace --wait --timeout 10m
+
+      - name: Patch overlays with ACR + image tag
+        shell: bash
+        env:
+          IMAGE_TAG:     ${{ needs.build.outputs.IMAGE_TAG_SUFFIX }}
+          PIN_SHA_INPUT: ${{ github.event.inputs.pin_sha }}
+        run: |
+          set -euo pipefail
+          PATCH="aks-yaml/overlays/${ENV}/patch-images.yaml"
+          [[ -f "$PATCH" ]] || { echo "No $PATCH to patch; skipping"; exit 0; }
+          ACR_FQDN="${{ secrets.ACR_NAME }}.${{ env.REGISTRY_FQDN_SUFFIX }}"
+          sed -i "s#__ACR_FQDN__#${ACR_FQDN}#g" "$PATCH"
+          if [[ "${PIN_SHA_INPUT:-yes}" == "yes" ]]; then
+            sed -i "s#latest-${ENV}#${IMAGE_TAG}#g" "$PATCH"
+          fi
+          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name  "github-actions"
+          git add "$PATCH" || true
+          git commit -m "ci: patch images (${ENV}) [skip ci]" || echo "No changes"
+          git push || true
+
+      - name: Install Argo CD (Helm)
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm repo add argo https://argoproj.github.io/argo-helm
+          VALUES="aks-yaml/ansible-monitoring-aks/values-argocd.yaml"
+          if [[ -f "$VALUES" ]]; then
+            helm upgrade -i argocd argo/argo-cd --namespace argocd --create-namespace --values "$VALUES" --wait --timeout 10m
+          else
+            helm upgrade -i argocd argo/argo-cd --namespace argocd --create-namespace --wait --timeout 10m
+          fi
+
+      - name: Bootstrap Argo applications
+        shell: bash
+        env:
+          ENV: ${{ needs.build.outputs.ENV }}
+        run: |
+          set -euo pipefail
+          apply_if_exists () { [[ -f "$1" ]] && kubectl apply -f "$1" || echo "skip $1"; }
+          apply_if_exists "aks-yaml/argocd/app-secrets-${ENV}.yaml"
+          apply_if_exists "aks-yaml/argocd/app-${ENV}.yaml"
+
+      - name: Show ArgoCD Applications
+        shell: bash
+        run: kubectl get applications.argoproj.io -A

@@ -1,0 +1,47 @@
+global:
+  image:
+    tag: v2.11.6
+
+server:
+  replicas: 1
+  extraArgs: [ "--insecure" ]
+  service:
+    type: LoadBalancer
+    ports: { http: 80, https: 443 }
+    annotations:
+      service.beta.kubernetes.io/azure-load-balancer-internal: "false"
+
+configs:
+  params:
+    server.insecure: true
+    applicationsetcontroller.enable.progressive.syncs: true
+
+  cm:
+    # سرعة المصالحة
+    timeout.reconciliation: 30s
+
+    # 🔹 أهم نقطة: فحص الصحة المخصص للـ SealedSecret تحت configs.cm
+    resource.customizations.health: |
+      bitnami.com/SealedSecret:
+        health.lua: |
+          hs = {}
+          if obj.status ~= nil and obj.status.conditions ~= nil then
+            for _, cond in ipairs(obj.status.conditions) do
+              if cond.type == "Synced" and cond.status == "True" then
+                hs.status = "Healthy"
+                hs.message = cond.message or "Unsealed"
+                return hs
+              end
+              if cond.type == "Synced" and cond.status == "False" then
+                hs.status = "Degraded"
+                hs.message = cond.message or "Unseal failed"
+                return hs
+              end
+            end
+          end
+          hs.status = "Progressing"
+          hs.message = "Waiting for controller to decrypt/apply"
+          return hs
+
+  rbac:
+    policy.default: role:readonly

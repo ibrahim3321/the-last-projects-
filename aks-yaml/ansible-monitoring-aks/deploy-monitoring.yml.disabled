@@ -1,0 +1,59 @@
+---
+- name: Deploy monitoring stack (Prometheus + Grafana) on AKS
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    kube_namespace: monitoring
+    release_name: kube-prom
+    chart: prometheus-community/kube-prometheus-stack
+    values_file: values-prometheus.yaml
+
+  tasks:
+    - name: Ensure monitoring namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata: { name: "{{ kube_namespace }}" }
+
+    - name: Add Helm repo prometheus-community
+      kubernetes.core.helm_repository:
+        name: prometheus-community
+        repo_url: https://prometheus-community.github.io/helm-charts
+        force_update: true
+
+    # Create required secrets that values file expects (if present via env)
+    - name: Ensure Slack webhook secret
+      when: lookup('env','SLACK_URL')|length > 0
+      command: >
+        kubectl -n {{ kube_namespace }} create secret generic slack-webhook-url
+        --from-literal=url={{ lookup('env','SLACK_URL') }}
+        --dry-run=client -o yaml | kubectl apply -f -
+      changed_when: false
+
+    - name: Ensure Grafana admin credentials secret
+      command: >
+        kubectl -n {{ kube_namespace }} create secret generic grafana-admin-credentials
+        --from-literal=admin-user={{ lookup('env','GF_ADMIN_USER')|default('admin', true) }}
+        --from-literal=admin-password={{ lookup('env','GF_ADMIN_PASS')|default('StrongP@ssw0rd', true) }}
+        --dry-run=client -o yaml | kubectl apply -f -
+      changed_when: false
+
+    - name: Install/Upgrade kube-prometheus-stack
+      kubernetes.core.helm:
+        name: "{{ release_name }}"
+        chart_ref: "{{ chart }}"
+        release_namespace: "{{ kube_namespace }}"
+        create_namespace: false
+        values_files: [ "{{ values_file }}" ]
+        wait: true
+        timeout: 900
+        atomic: true
+
+    - name: Show services
+      command: kubectl get svc -n {{ kube_namespace }}
+      register: svc_out
+    - debug: var=svc_out.stdout_lines

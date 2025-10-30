@@ -1,0 +1,10 @@
+# aks-yaml/base/frontend-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+data:
+  config.json: |
+    {
+      "API_URL": "/api"
+    }
