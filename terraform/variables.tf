@@ -45,5 +45,10 @@ variable "disk_size_gb" {
 variable "storage_account_type" {
   description = "The type of storage account for the managed disk"
   type        = string
+} 
+variable "acr_id" {
+  description = "Existing ACR resource ID to grant AcrPull to AKS. Leave empty to skip."
+  type        = string
+  default     = ""
 }
 

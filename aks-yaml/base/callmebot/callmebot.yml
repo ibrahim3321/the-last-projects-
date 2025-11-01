@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: callmebot-adapter
+  labels: { app: callmebot-adapter }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: callmebot-adapter } }
+  template:
+    metadata:
+      labels: { app: callmebot-adapter }
+    spec:
+      containers:
+        - name: callmebot-adapter
+          image: __ACR_FQDN__/callmebot-adapter:latest
+          ports: [ { containerPort: 8080 } ]
+          env:
+            - name: phone
+              valueFrom: { secretKeyRef: { name: callmebot-config, key: phone } }
+            - name: apikey
+              valueFrom: { secretKeyRef: { name: callmebot-config, key: apikey } }
+            - name: base_url
+              valueFrom: { secretKeyRef: { name: callmebot-config, key: base_url } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: callmebot-adapter
+spec:
+  selector: { app: callmebot-adapter }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP

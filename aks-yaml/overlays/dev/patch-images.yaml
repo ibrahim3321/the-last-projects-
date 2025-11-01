@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: backend
+          image: group6acr.azurecr.io/backend:8745c38e29da950cf9c39b80c9a920d1e15f1bfb-dev
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-deployment
+spec:
+  template:
+    spec:
+      containers:
+        - name: frontend
+          image: group6acr.azurecr.io/frontend:8745c38e29da950cf9c39b80c9a920d1e15f1bfb-dev
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: callmebot-adapter
+spec:
+  template:
+    spec:
+      containers:
+        - name: callmebot-adapter
+          image: group6acr.azurecr.io/callmebot-adapter:8745c38e29da950cf9c39b80c9a920d1e15f1bfb-dev
